@@ -141,29 +141,47 @@ term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
   return true;
 });
 
-// Fallback paste listener: if focus is on the terminal area (not an input/textarea outside xterm),
-// still route clipboard dictation/paste cleanly into xterm.
-window.addEventListener("paste", (ev: ClipboardEvent) => {
-  const target = ev.target as HTMLElement | null;
-  if (
-    target &&
-    (target === composerInput ||
-      target === authInputEl ||
-      (target.tagName === "INPUT" && target !== term.textarea) ||
-      (target.tagName === "TEXTAREA" && target !== term.textarea))
-  ) {
-    return;
-  }
-  // If xterm's own textarea is focused, xterm handles the native paste event itself.
-  if (target === term.textarea) return;
+// Single unified paste handler (capture phase) for clipboard paste & voice-IME dictation (Typeless, etc.):
+// 1. Prevents double-injection;
+// 2. Strips trailing newlines so dictation NEVER auto-submits with Enter;
+// 3. Uses atomic Bracketed Paste when supported, or collapses internal newlines to spaces when not,
+//    preventing multi-paragraph dictation from splitting and accidentally triggering Enter mid-message.
+window.addEventListener(
+  "paste",
+  (ev: ClipboardEvent) => {
+    const target = ev.target as HTMLElement | null;
+    if (
+      target &&
+      (target === composerInput ||
+        target === authInputEl ||
+        (target.tagName === "INPUT" && target !== term.textarea) ||
+        (target.tagName === "TEXTAREA" && target !== term.textarea))
+    ) {
+      return;
+    }
 
-  const text = ev.clipboardData?.getData("text/plain");
-  if (text && activeSessionId) {
+    const raw = ev.clipboardData?.getData("text/plain");
+    if (!raw || !activeSessionId) return;
+
     ev.preventDefault();
-    term.paste(text);
+    ev.stopImmediatePropagation();
+
+    // Never auto-submit on trailing CR/LF
+    const trimmedEnd = raw.replace(/[\r\n]+$/, "");
+    if (!trimmedEnd) return;
+
+    if (term.modes.bracketedPasteMode) {
+      const normalized = trimmedEnd.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      sendTerminalInput(`\x1b[200~${normalized}\x1b[201~`);
+    } else {
+      // Without bracketed paste, any CR/LF acts as Enter and submits immediately.
+      const singleLine = trimmedEnd.replace(/[\r\n]+/g, " ");
+      sendTerminalInput(singleLine);
+    }
     term.focus();
-  }
-});
+  },
+  { capture: true }
+);
 
 function findSession(id: string | null): SessionInfo | null {
   if (!id) return null;
