@@ -15,12 +15,21 @@ pub struct RiftConfig {
     pub shell: String,
 }
 
+fn detect_local_ip() -> Option<String> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    let ip = sock.local_addr().ok()?.ip();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    Some(ip.to_string())
+}
+
 impl Default for RiftConfig {
     fn default() -> Self {
-        let host = hostname::get()
-            .ok()
-            .and_then(|s| s.into_string().ok())
-            .unwrap_or_else(|| "host".to_string());
+        let host = detect_local_ip()
+            .or_else(|| hostname::get().ok().and_then(|s| s.into_string().ok()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         Self {
             relay: "ws://127.0.0.1:7700".to_string(),
             host,

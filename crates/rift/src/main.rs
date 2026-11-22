@@ -140,6 +140,7 @@ enum HookAction {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     let mut cfg: RiftConfig = load_config();
     if let Some(r) = cli.relay {
