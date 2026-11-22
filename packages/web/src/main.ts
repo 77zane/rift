@@ -36,14 +36,28 @@ const authModalEl = document.getElementById("auth-modal") as HTMLElement;
 const authFormEl = document.getElementById("auth-form") as HTMLFormElement;
 const authInputEl = document.getElementById("auth-input") as HTMLInputElement;
 const authErrorEl = document.getElementById("auth-error") as HTMLElement;
+const btnPickImage = document.getElementById("btn-pick-image") as HTMLButtonElement | null;
+const imageFileInput = document.getElementById("image-file-input") as HTMLInputElement | null;
+const toastEl = document.getElementById("toast") as HTMLElement | null;
 
 const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
 
 let ws: WebSocket | null = null;
 let hosts: HostGroup[] = [];
 let activeSessionId: string | null = null;
-// Always default to "follow-host" so opening a browser NEVER squishes the local Windows Terminal PTY width.
+let initialHashSessionId: string | null = location.hash
+  ? decodeURIComponent(location.hash.slice(1))
+  : null;
+let pendingSpawnHostId: string | null = null;
+let pendingSpawnKnownIds = new Set<string>();
+const prevAgentStates = new Map<string, string>();
+let unreadTitleAlert: string | null = null;
+let toastTimer: number | null = null;
+// Per-session manual size mode overrides.
+// Default policy:
+//   - Remote `+` (headless) sessions -> "fit-local" (fills 100% of browser screen!)
+//   - Local desktop (WT/Ghostty) sessions -> "follow-host" (never squishes local desktop layout!)
+const sizeModeOverrides = new Map<string, "follow-host" | "fit-local">();
 let sizeMode: "follow-host" | "fit-local" = "follow-host";
 let mobileBarVisible = isMobileViewport();
 let reconnectTimer: number | null = null;
@@ -84,25 +98,120 @@ const XTERM_THEMES = {
   },
 };
 
-const term = new Terminal({
-  cursorBlink: true,
-  fontSize: isMobileViewport() ? 12 : 14,
-  fontFamily: '"JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace',
-  scrollback: 5000,
-  theme: XTERM_THEMES[themeName],
-});
+interface SessionTerminal {
+  term: Terminal;
+  fitAddon: FitAddon;
+  pane: HTMLDivElement;
+  decoder: TextDecoder;
+  lastSeq: number | null;
+}
+
+const sessionTerms = new Map<string, SessionTerminal>();
+
+function getOrCreateSessionTerm(sessionId: string): SessionTerminal {
+  const existing = sessionTerms.get(sessionId);
+  if (existing) return existing;
+
+  const pane = document.createElement("div");
+  pane.className = "session-term-pane hidden";
+  termContainerEl.appendChild(pane);
+
+  const term = new Terminal({
+    cursorBlink: true,
+    fontSize: isMobileViewport() ? 12 : 15,
+    lineHeight: 1.15,
+    fontFamily: '"JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace',
+    scrollback: 10000,
+    theme: XTERM_THEMES[themeName],
+  });
+
+  const fitAddon = new FitAddon();
+  term.loadAddon(fitAddon);
+  // Ctrl+Click (Windows/Linux) or Cmd+Click (macOS) opens links in a new tab; plain tap works on mobile.
+  term.loadAddon(
+    new WebLinksAddon((ev: MouseEvent, uri: string) => {
+      if (isMobileViewport() || ev.ctrlKey || ev.metaKey) {
+        window.open(uri, "_blank", "noopener,noreferrer");
+      }
+    })
+  );
+  term.open(pane);
+
+  term.onData((data) => {
+    if (activeSessionId === sessionId) {
+      sendTerminalInput(data);
+    }
+  });
+
+  // Enable Shift+Enter newline, native paste & voice-IME dictation (Typeless, Wispr Flow, etc.)
+  term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+    if (
+      ev.key === "Enter" &&
+      ev.shiftKey &&
+      !ev.ctrlKey &&
+      !ev.metaKey &&
+      !ev.altKey &&
+      !ev.isComposing &&
+      ev.keyCode !== 229
+    ) {
+      if (ev.type === "keydown") {
+        ev.preventDefault();
+        sendTerminalInput("\x1b[27;2;13~");
+      }
+      return false;
+    }
+
+    const key = ev.key.toLowerCase();
+    const mod = ev.ctrlKey || ev.metaKey;
+
+    // Allow native paste (Ctrl+V, Ctrl+Shift+V, Cmd+V)
+    if (mod && !ev.altKey && key === "v") {
+      return false;
+    }
+
+    // Allow native copy (Cmd+C, Ctrl+Shift+C, or Ctrl+C when terminal has a selection)
+    if (mod && !ev.altKey && key === "c") {
+      if (ev.metaKey || ev.shiftKey || term.hasSelection()) {
+        return false;
+      }
+    }
+
+    return true;
+  });
+
+  const entry: SessionTerminal = {
+    term,
+    fitAddon,
+    pane,
+    decoder: new TextDecoder(),
+    lastSeq: null,
+  };
+  sessionTerms.set(sessionId, entry);
+  return entry;
+}
+
+function getActiveSessionTerm(): SessionTerminal | null {
+  return activeSessionId ? sessionTerms.get(activeSessionId) ?? null : null;
+}
+
+function disposeStaleSessionTerms(validIds: Set<string>): void {
+  for (const [id, entry] of sessionTerms) {
+    if (!validIds.has(id)) {
+      entry.term.dispose();
+      entry.pane.remove();
+      sessionTerms.delete(id);
+    }
+  }
+}
 
 function applyTheme(): void {
   document.documentElement.dataset.theme = themeName;
   btnTheme.textContent = themeName === "ember" ? "EMBER" : "PHOSPHOR";
-  term.options.theme = XTERM_THEMES[themeName];
+  for (const entry of sessionTerms.values()) {
+    entry.term.options.theme = XTERM_THEMES[themeName];
+  }
   localStorage.setItem("rift_theme", themeName);
 }
-
-const fitAddon = new FitAddon();
-term.loadAddon(fitAddon);
-term.loadAddon(new WebLinksAddon());
-term.open(termContainerEl);
 
 function sendControl(msg: ControlMessage): void {
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -116,52 +225,99 @@ function sendTerminalInput(text: string): void {
   ws.send(encodeBinaryFrame(FRAME_PTY_INPUT, activeSessionId, payload));
 }
 
-term.onData((data) => {
-  sendTerminalInput(data);
-});
-
-// Enable native paste & voice-IME dictation (Typeless, Wispr Flow, Windows Voice Typing, etc.):
-// By default on Windows/Linux, xterm.js swallows Ctrl+V as raw ^V (\x16) instead of triggering browser paste.
-term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
-  const key = ev.key.toLowerCase();
-  const mod = ev.ctrlKey || ev.metaKey;
-
-  // Allow native paste (Ctrl+V, Ctrl+Shift+V, Cmd+V)
-  if (mod && !ev.altKey && key === "v") {
-    return false;
+function showToast(message: string, durationMs = 2400): void {
+  if (!toastEl) return;
+  toastEl.textContent = message;
+  toastEl.classList.remove("hidden");
+  if (toastTimer !== null) {
+    clearTimeout(toastTimer);
   }
+  toastTimer = window.setTimeout(() => {
+    toastEl.classList.add("hidden");
+    toastTimer = null;
+  }, durationMs);
+}
 
-  // Allow native copy (Cmd+C, Ctrl+Shift+C, or Ctrl+C when terminal has a selection)
-  if (mod && !ev.altKey && key === "c") {
-    if (ev.metaKey || ev.shiftKey || term.hasSelection()) {
-      return false;
-    }
+function updateDocumentTitle(): void {
+  if (unreadTitleAlert && document.hidden) {
+    document.title = unreadTitleAlert;
+    return;
   }
+  unreadTitleAlert = null;
+  const current = findSession(activeSessionId);
+  document.title = current ? `${current.title} // Rift` : "Rift // terminal mirror";
+}
 
-  return true;
-});
+function uploadPastedImage(file: File): void {
+  if (!activeSessionId) {
+    showToast("请先选择一个终端会话");
+    return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    showToast("图片超过 10MB 限制", 3000);
+    return;
+  }
+  showToast("正在上传图片…", 5000);
+  const reader = new FileReader();
+  reader.onload = () => {
+    const result = typeof reader.result === "string" ? reader.result : "";
+    const commaIdx = result.indexOf(",");
+    if (commaIdx < 0 || !activeSessionId) return;
+    const base64 = result.slice(commaIdx + 1);
+    sendControl({
+      type: "term.paste_image",
+      sessionId: activeSessionId,
+      mime: file.type || "image/png",
+      data: base64,
+    });
+    showToast("图片已发送至终端");
+  };
+  reader.onerror = () => {
+    showToast("图片读取失败", 3000);
+  };
+  reader.readAsDataURL(file);
+}
 
-// Single unified paste handler (capture phase) for clipboard paste & voice-IME dictation (Typeless, etc.):
-// 1. Prevents double-injection;
+// Single unified paste handler (capture phase) for text, voice-IME dictation (Typeless), AND images:
+// 1. Supports pasting screenshots/images into both the terminal and the bottom composer input;
 // 2. Strips trailing newlines so dictation NEVER auto-submits with Enter;
-// 3. Uses atomic Bracketed Paste when supported, or collapses internal newlines to spaces when not,
-//    preventing multi-paragraph dictation from splitting and accidentally triggering Enter mid-message.
+// 3. Uses atomic Bracketed Paste when supported, or collapses internal newlines to spaces when not.
 window.addEventListener(
   "paste",
   (ev: ClipboardEvent) => {
     const target = ev.target as HTMLElement | null;
+    if (target === authInputEl) return;
+
+    // 1. Check for image items in clipboard first (works in both terminal AND composerInput!)
+    const items = ev.clipboardData?.items;
+    if (items && activeSessionId) {
+      for (const item of Array.from(items)) {
+        if (item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            ev.preventDefault();
+            ev.stopImmediatePropagation();
+            uploadPastedImage(file);
+            return;
+          }
+        }
+      }
+    }
+
+    const activeTerm = getActiveSessionTerm()?.term;
+
+    // 2. Let normal text paste work inside composerInput / other inputs
     if (
       target &&
       (target === composerInput ||
-        target === authInputEl ||
-        (target.tagName === "INPUT" && target !== term.textarea) ||
-        (target.tagName === "TEXTAREA" && target !== term.textarea))
+        (target.tagName === "INPUT" && target !== activeTerm?.textarea) ||
+        (target.tagName === "TEXTAREA" && target !== activeTerm?.textarea))
     ) {
       return;
     }
 
     const raw = ev.clipboardData?.getData("text/plain");
-    if (!raw || !activeSessionId) return;
+    if (!raw || !activeSessionId || !activeTerm) return;
 
     ev.preventDefault();
     ev.stopImmediatePropagation();
@@ -170,7 +326,7 @@ window.addEventListener(
     const trimmedEnd = raw.replace(/[\r\n]+$/, "");
     if (!trimmedEnd) return;
 
-    if (term.modes.bracketedPasteMode) {
+    if (activeTerm.modes.bracketedPasteMode) {
       const normalized = trimmedEnd.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
       sendTerminalInput(`\x1b[200~${normalized}\x1b[201~`);
     } else {
@@ -178,10 +334,27 @@ window.addEventListener(
       const singleLine = trimmedEnd.replace(/[\r\n]+/g, " ");
       sendTerminalInput(singleLine);
     }
-    term.focus();
+    activeTerm.focus();
   },
   { capture: true }
 );
+
+// Also support dragging & dropping an image directly onto the terminal
+termContainerEl.addEventListener("dragover", (ev) => {
+  if (ev.dataTransfer?.types.includes("Files")) {
+    ev.preventDefault();
+  }
+});
+termContainerEl.addEventListener("drop", (ev) => {
+  const files = ev.dataTransfer?.files;
+  if (!files || files.length === 0) return;
+  for (const file of Array.from(files)) {
+    if (file.type.startsWith("image/")) {
+      ev.preventDefault();
+      uploadPastedImage(file);
+    }
+  }
+});
 
 function findSession(id: string | null): SessionInfo | null {
   if (!id) return null;
@@ -191,6 +364,16 @@ function findSession(id: string | null): SessionInfo | null {
     }
   }
   return null;
+}
+
+function resolveSizeModeFor(sess: SessionInfo | null): "follow-host" | "fit-local" {
+  if (!sess) return "follow-host";
+  const manual = sizeModeOverrides.get(sess.sessionId);
+  if (manual) return manual;
+  // Remote-spawned headless sessions have no local physical window -> fill browser screen!
+  if (sess.headless && !isMobileViewport()) return "fit-local";
+  if (sess.headless && isMobileViewport()) return "fit-local";
+  return "follow-host";
 }
 
 function updateSizeModeUI(): void {
@@ -209,7 +392,9 @@ function updateMobileBarUI(): void {
 
 function applyTerminalSize(): void {
   const sess = findSession(activeSessionId);
-  if (!sess) return;
+  const entry = getActiveSessionTerm();
+  if (!sess || !entry) return;
+  const { term, fitAddon } = entry;
   if (sizeMode === "follow-host") {
     if (term.cols !== sess.cols || term.rows !== sess.rows) {
       term.resize(sess.cols, sess.rows);
@@ -242,37 +427,55 @@ function attachSession(sessionId: string): void {
     return;
   }
   if (activeSessionId) {
+    const prevEntry = sessionTerms.get(activeSessionId);
+    if (prevEntry) prevEntry.pane.classList.add("hidden");
     sendControl({ type: "web.detach", sessionId: activeSessionId });
   }
   activeSessionId = sessionId;
-  term.reset();
+  initialHashSessionId = null;
+  history.replaceState(null, "", `#${encodeURIComponent(sessionId)}`);
+
+  const entry = getOrCreateSessionTerm(sessionId);
   emptyStateEl.classList.add("hidden");
   termContainerEl.classList.remove("hidden");
+  entry.pane.classList.remove("hidden");
 
   const sess = findSession(sessionId);
   if (sess) {
-    activeTitleEl.textContent = `${sess.hostName} / ${sess.title}`;
-    applyTerminalSize();
+    sizeMode = resolveSizeModeFor(sess);
+    activeTitleEl.textContent = `${sess.hostName} :: ${sess.title}`;
+    updateSizeModeUI();
   }
-  sendControl({ type: "web.attach", sessionId });
+  updateDocumentTitle();
+  sendControl({
+    type: "web.attach",
+    sessionId,
+    sinceSeq: entry.lastSeq ?? undefined,
+  });
   renderHostList();
   closeMobileSidebar();
   if (!isMobileViewport()) {
-    term.focus();
+    entry.term.focus();
+  }
+}
+
+function startRenameSession(s: SessionInfo): void {
+  const next = window.prompt("重命名终端标签：", s.title || s.shell);
+  if (next && next.trim() && next.trim() !== s.title) {
+    sendControl({ type: "term.rename", sessionId: s.sessionId, title: next.trim() });
   }
 }
 
 const AGENT_STATE_LABEL: Record<string, string> = {
-  running: "思考中",
-  tool: "执行工具",
-  waiting: "待确认",
+  running: "运行中",
+  tool: "运行中",
+  waiting: "等待输入",
   idle: "空闲",
 };
 
 function formatAgentText(s: SessionInfo): string | null {
   if (!s.agentName || !s.agentState) return null;
-  const label = AGENT_STATE_LABEL[s.agentState] ?? s.agentState;
-  return `${s.agentName.toUpperCase()} · ${label}`;
+  return AGENT_STATE_LABEL[s.agentState] ?? s.agentState;
 }
 
 function renderHostList(): void {
@@ -306,16 +509,29 @@ function renderHostList(): void {
     spawnBtn.title = `在 ${host.hostName} 上新建原生终端标签页`;
     spawnBtn.onclick = (e) => {
       e.stopPropagation();
+      pendingSpawnHostId = host.hostId;
+      pendingSpawnKnownIds = new Set(host.sessions.map((s) => s.sessionId));
       sendControl({ type: "host.spawn", hostId: host.hostId });
+      showToast(`正在 ${host.hostName} 新建终端…`);
     };
 
     headerEl.append(metaEl, spawnBtn);
     groupEl.append(headerEl);
 
+    const titleCounts = new Map<string, number>();
     for (const s of host.sessions) {
+      const baseTitle = s.title || s.shell;
+      const seen = (titleCounts.get(baseTitle) ?? 0) + 1;
+      titleCounts.set(baseTitle, seen);
+      const displayTitle = seen > 1 && !s.customTitle ? `${baseTitle} #${seen}` : baseTitle;
+
       const itemEl = document.createElement("div");
       itemEl.className = "session-item" + (s.sessionId === activeSessionId ? " active" : "");
       itemEl.onclick = () => attachSession(s.sessionId);
+      itemEl.ondblclick = (e) => {
+        e.stopPropagation();
+        startRenameSession(s);
+      };
 
       const infoEl = document.createElement("div");
       infoEl.className = "session-info";
@@ -325,26 +541,32 @@ function renderHostList(): void {
       const dotEl = document.createElement("span");
       dotEl.className = "session-dot";
       const titleTextEl = document.createElement("span");
-      titleTextEl.textContent = s.title || s.shell;
+      titleTextEl.textContent = displayTitle;
       titleEl.append(dotEl, titleTextEl);
 
       const subEl = document.createElement("div");
-      subEl.className = "session-sub";
-      subEl.textContent = `${s.shell} · ${s.cols}×${s.rows}`;
+      const agentText = formatAgentText(s);
+      if (agentText && s.agentState) {
+        subEl.className = `session-sub agent-status state-${s.agentState}`;
+        subEl.textContent = agentText;
+      } else {
+        subEl.className = "session-sub";
+        subEl.textContent = s.shell;
+      }
 
       infoEl.append(titleEl, subEl);
 
-      const agentText = formatAgentText(s);
-      if (agentText && s.agentState) {
-        const badgeEl = document.createElement("div");
-        badgeEl.className = `agent-badge state-${s.agentState}`;
-        const bDot = document.createElement("span");
-        bDot.className = "agent-badge-dot";
-        const bText = document.createElement("span");
-        bText.textContent = agentText;
-        badgeEl.append(bDot, bText);
-        infoEl.append(badgeEl);
-      }
+      const actionsEl = document.createElement("div");
+      actionsEl.className = "session-actions";
+
+      const renameBtn = document.createElement("button");
+      renameBtn.className = "action-btn";
+      renameBtn.textContent = "✎";
+      renameBtn.title = "重命名（也可双击标签）";
+      renameBtn.onclick = (e) => {
+        e.stopPropagation();
+        startRenameSession(s);
+      };
 
       const closeBtn = document.createElement("button");
       closeBtn.className = "close-btn";
@@ -352,12 +574,13 @@ function renderHostList(): void {
       closeBtn.title = "关闭该终端";
       closeBtn.onclick = (e) => {
         e.stopPropagation();
-        if (confirm(`确定关闭 ${host.hostName} 上的「${s.title}」吗？`)) {
+        if (confirm(`确定关闭 ${host.hostName} 上的「${displayTitle}」吗？`)) {
           sendControl({ type: "term.close", sessionId: s.sessionId });
         }
       };
 
-      itemEl.append(infoEl, closeBtn);
+      actionsEl.append(renameBtn, closeBtn);
+      itemEl.append(infoEl, actionsEl);
       groupEl.append(itemEl);
     }
 
@@ -370,20 +593,29 @@ function renderHostList(): void {
   if (current) {
     const agentBadge = formatAgentText(current);
     activeTitleEl.textContent = agentBadge
-      ? `${current.hostName} :: ${current.title} [${agentBadge}] · ${current.cols}×${current.rows}`
-      : `${current.hostName} :: ${current.title} · ${current.cols}×${current.rows}`;
-    if (sizeMode === "follow-host") {
+      ? `${current.hostName} :: ${current.title} [${agentBadge}]`
+      : `${current.hostName} :: ${current.title}`;
+    const desired = resolveSizeModeFor(current);
+    if (desired !== sizeMode) {
+      sizeMode = desired;
+      updateSizeModeUI();
+    } else if (sizeMode === "follow-host") {
       applyTerminalSize();
     }
   } else {
     activeSessionId = null;
     if (total > 0) {
-      const firstSession = hosts.flatMap((h) => h.sessions)[0];
-      if (firstSession) attachSession(firstSession.sessionId);
+      const allSessions = hosts.flatMap((h) => h.sessions);
+      const hashTarget = initialHashSessionId
+        ? allSessions.find((s) => s.sessionId === initialHashSessionId)
+        : undefined;
+      const target = hashTarget ?? allSessions[0];
+      if (target) attachSession(target.sessionId);
     } else {
       activeTitleEl.textContent = "NO ACTIVE SESSION";
       termContainerEl.classList.add("hidden");
       emptyStateEl.classList.remove("hidden");
+      updateDocumentTitle();
     }
   }
 }
@@ -416,12 +648,18 @@ function connect(): void {
   socket.onmessage = (ev) => {
     if (ev.data instanceof ArrayBuffer) {
       const frame = decodeBinaryFrame(new Uint8Array(ev.data));
-      if (!frame || frame.sessionId !== activeSessionId) return;
+      if (!frame) return;
+      const entry = sessionTerms.get(frame.sessionId);
+      if (!entry) return;
       if (frame.frameType === FRAME_PTY_REPLAY) {
-        term.reset();
-        term.write(textDecoder.decode(frame.payload));
+        entry.decoder = new TextDecoder();
+        entry.term.reset();
+        entry.term.write(entry.decoder.decode(frame.payload, { stream: true }));
       } else if (frame.frameType === FRAME_PTY_OUTPUT) {
-        term.write(textDecoder.decode(frame.payload));
+        entry.term.write(entry.decoder.decode(frame.payload, { stream: true }));
+        if (entry.lastSeq !== null) {
+          entry.lastSeq += frame.payload.length;
+        }
       }
       return;
     }
@@ -430,6 +668,14 @@ function connect(): void {
     try {
       msg = JSON.parse(String(ev.data)) as ControlMessage;
     } catch {
+      return;
+    }
+
+    if (msg.type === "web.sync") {
+      const entry = sessionTerms.get(msg.sessionId);
+      if (entry) {
+        entry.lastSeq = msg.seq;
+      }
       return;
     }
 
@@ -447,14 +693,60 @@ function connect(): void {
 
     if (msg.type === "web.list") {
       hosts = msg.hosts;
+
+      // Dispose xterm instances for sessions that have closed
+      const validIds = new Set<string>();
+      const nextStates = new Map<string, string>();
+      for (const h of hosts) {
+        for (const s of h.sessions) {
+          validIds.add(s.sessionId);
+          if (s.agentState) {
+            nextStates.set(s.sessionId, s.agentState);
+            const prev = prevAgentStates.get(s.sessionId);
+            if (
+              document.hidden &&
+              (prev === "running" || prev === "tool") &&
+              (s.agentState === "idle" || s.agentState === "waiting")
+            ) {
+              const label = s.agentState === "waiting" ? "等待输入" : "已完成";
+              unreadTitleAlert = `● [${label}] ${s.title} — Rift`;
+            }
+          }
+        }
+      }
+      disposeStaleSessionTerms(validIds);
+      prevAgentStates.clear();
+      for (const [k, v] of nextStates) prevAgentStates.set(k, v);
+
+      // Auto-switch to a newly spawned `+` session on the target host
+      let spawnedSessionId: string | null = null;
+      if (pendingSpawnHostId) {
+        const targetHost = hosts.find((h) => h.hostId === pendingSpawnHostId);
+        const newSess = targetHost?.sessions.find((s) => !pendingSpawnKnownIds.has(s.sessionId));
+        if (newSess) {
+          spawnedSessionId = newSess.sessionId;
+          pendingSpawnHostId = null;
+          pendingSpawnKnownIds.clear();
+        }
+      }
+
       const prevActive = activeSessionId;
       renderHostList();
-      if (needsReattach && prevActive && findSession(prevActive)) {
+      if (spawnedSessionId) {
         needsReattach = false;
-        sendControl({ type: "web.attach", sessionId: prevActive });
+        attachSession(spawnedSessionId);
+      } else if (needsReattach && prevActive && findSession(prevActive)) {
+        needsReattach = false;
+        const entry = sessionTerms.get(prevActive);
+        sendControl({
+          type: "web.attach",
+          sessionId: prevActive,
+          sinceSeq: entry?.lastSeq ?? undefined,
+        });
       } else {
         needsReattach = false;
       }
+      updateDocumentTitle();
     }
   };
 
@@ -484,6 +776,9 @@ backdropEl.onclick = closeMobileSidebar;
 
 btnSizeMode.onclick = () => {
   sizeMode = sizeMode === "follow-host" ? "fit-local" : "follow-host";
+  if (activeSessionId) {
+    sizeModeOverrides.set(activeSessionId, sizeMode);
+  }
   updateSizeModeUI();
 };
 
@@ -510,11 +805,29 @@ const QUICK_KEY_MAP: Record<string, string> = {
 };
 
 document.querySelectorAll<HTMLButtonElement>(".qkey").forEach((btn) => {
+  const key = btn.dataset.key;
+  if (!key) return;
   btn.onclick = () => {
-    const key = btn.dataset.key;
-    const seq = key ? QUICK_KEY_MAP[key] : undefined;
+    const seq = QUICK_KEY_MAP[key];
     if (seq) sendTerminalInput(seq);
   };
+});
+
+if (btnPickImage && imageFileInput) {
+  btnPickImage.onclick = () => imageFileInput.click();
+  imageFileInput.onchange = () => {
+    const file = imageFileInput.files?.[0];
+    if (file) {
+      uploadPastedImage(file);
+    }
+    imageFileInput.value = "";
+  };
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    updateDocumentTitle();
+  }
 });
 
 composerForm.onsubmit = (e) => {

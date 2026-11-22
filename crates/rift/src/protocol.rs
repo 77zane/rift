@@ -52,6 +52,8 @@ pub enum ControlMessage {
         cwd: String,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        headless: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
     },
@@ -108,6 +110,12 @@ pub enum ControlMessage {
     },
     #[serde(rename = "term.close", rename_all = "camelCase")]
     TermClose { session_id: String },
+    #[serde(rename = "term.paste_image", rename_all = "camelCase")]
+    TermPasteImage {
+        session_id: String,
+        mime: String,
+        data: String,
+    },
     #[serde(rename = "error", rename_all = "camelCase")]
     Error { message: String },
 }

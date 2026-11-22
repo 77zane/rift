@@ -1,0 +1,77 @@
+name: Release Rift Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: rift.exe
+            asset: rift-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            bin: rift
+            asset: rift-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: rift
+            asset: rift-macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            bin: rift
+            asset: rift-macos-x86_64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl-tools (Linux)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --manifest-path crates/rift/Cargo.toml --target ${{ matrix.target }}
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          cp "crates/rift/target/${{ matrix.target }}/release/${{ matrix.bin }}" "release-assets/${{ matrix.asset }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: release-assets/${{ matrix.asset }}
+
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*

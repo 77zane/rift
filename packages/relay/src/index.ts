@@ -63,6 +63,19 @@ const sessions = new Map<string, AgentSession>();
 const hostDaemons = new Map<string, HostDaemon>();
 const webClients = new Set<WebClient>();
 
+// Lightweight in-memory brute-force protection for WEB_TOKEN auth (5 fails -> 15 min lock per IP)
+const MAX_AUTH_FAILS = 5;
+const AUTH_LOCK_MS = 15 * 60 * 1000;
+const authFailures = new Map<string, { count: number; lockedUntil: number }>();
+
+function extractClientIp(req: http.IncomingMessage): string {
+  const realIp = req.headers["x-real-ip"];
+  if (typeof realIp === "string" && realIp.trim()) return realIp.trim();
+  const xff = req.headers["x-forwarded-for"];
+  if (typeof xff === "string" && xff.trim()) return xff.split(",")[0].trim();
+  return req.socket.remoteAddress ?? "unknown";
+}
+
 function toUint8Array(data: RawData): Uint8Array {
   if (data instanceof Uint8Array) return data;
   if (Array.isArray(data)) return Buffer.concat(data);
@@ -223,7 +236,7 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void 
 
 const server = http.createServer(serveStatic);
 const agentWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
-const webWss = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
+const webWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
 
 server.on("upgrade", (req, socket, head) => {
   const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -320,7 +333,7 @@ agentWss.on("connection", (ws) => {
 
       const existing = sessions.get(msg.sessionId);
       const viewers = existing ? existing.viewers : new Set<WebClient>();
-      const buffer = existing ? existing.buffer : new ByteRingBuffer(256 * 1024);
+      const buffer = existing ? existing.buffer : new ByteRingBuffer(4 * 1024 * 1024);
       if (existing && existing.ws !== ws) {
         existing.ws.close(4002, "Replaced by reconnecting agent");
       }
@@ -334,11 +347,13 @@ agentWss.on("connection", (ws) => {
           hostId: msg.hostId,
           hostName: msg.hostName,
           platform: msg.platform,
-          title: msg.title,
+          title: existing?.info.customTitle ? existing.info.title : msg.title,
           shell: msg.shell,
           cwd: msg.cwd,
           cols: msg.cols,
           rows: msg.rows,
+          headless: Boolean(msg.headless),
+          customTitle: existing?.info.customTitle ?? false,
           createdAt: existing ? existing.info.createdAt : now,
           lastActiveAt: now,
         },
@@ -355,7 +370,7 @@ agentWss.on("connection", (ws) => {
       const sess = sessions.get(boundSessionId);
       if (!sess) return;
       let changed = false;
-      if (msg.title !== undefined && msg.title !== sess.info.title) {
+      if (msg.title !== undefined && !sess.info.customTitle && msg.title !== sess.info.title) {
         sess.info.title = msg.title;
         changed = true;
       }
@@ -418,7 +433,8 @@ agentWss.on("connection", (ws) => {
   });
 });
 
-webWss.on("connection", (ws) => {
+webWss.on("connection", (ws, req) => {
+  const clientIp = extractClientIp(req);
   const client: WebClient = {
     ws,
     authed: !WEB_TOKEN,
@@ -446,12 +462,33 @@ webWss.on("connection", (ws) => {
         return;
       }
       if (msg.type === "web.auth") {
+        const now = Date.now();
+        const rec = authFailures.get(clientIp);
+        if (rec && rec.lockedUntil > now) {
+          const mins = Math.ceil((rec.lockedUntil - now) / 60000);
+          sendJson(ws, {
+            type: "web.auth_err",
+            message: `尝试次数过多，请 ${mins} 分钟后再试`,
+          });
+          return;
+        }
         if (msg.token === WEB_TOKEN) {
+          authFailures.delete(clientIp);
           client.authed = true;
           sendJson(ws, { type: "web.auth_ok", authRequired: true });
           sendJson(ws, { type: "web.list", hosts: buildHostGroups() });
         } else {
-          sendJson(ws, { type: "web.auth_err", message: "Token 不正确" });
+          const nextCount = (rec ? rec.count : 0) + 1;
+          const lockedUntil = nextCount >= MAX_AUTH_FAILS ? now + AUTH_LOCK_MS : 0;
+          authFailures.set(clientIp, { count: nextCount, lockedUntil });
+          const remain = MAX_AUTH_FAILS - nextCount;
+          sendJson(ws, {
+            type: "web.auth_err",
+            message:
+              remain > 0
+                ? `Token 不正确（剩余 ${remain} 次机会）`
+                : "尝试次数过多，已锁定 15 分钟",
+          });
         }
       }
       return;
@@ -483,10 +520,22 @@ webWss.on("connection", (ws) => {
       }
       client.attachedSessionId = msg.sessionId;
       sess.viewers.add(client);
+      const headSeq = sess.buffer.headOffset;
+      if (typeof msg.sinceSeq === "number") {
+        const delta = sess.buffer.sliceSince(msg.sinceSeq);
+        if (delta !== null) {
+          if (delta.length > 0 && ws.readyState === WebSocket.OPEN) {
+            ws.send(encodeBinaryFrame(FRAME_PTY_OUTPUT, msg.sessionId, delta));
+          }
+          sendJson(ws, { type: "web.sync", sessionId: msg.sessionId, seq: headSeq });
+          return;
+        }
+      }
       const snap = sess.buffer.snapshot();
       if (snap.length > 0 && ws.readyState === WebSocket.OPEN) {
         ws.send(encodeBinaryFrame(FRAME_PTY_REPLAY, msg.sessionId, snap));
       }
+      sendJson(ws, { type: "web.sync", sessionId: msg.sessionId, seq: headSeq });
       return;
     }
 
@@ -524,6 +573,25 @@ webWss.on("connection", (ws) => {
     if (msg.type === "term.close") {
       const sess = sessions.get(msg.sessionId);
       if (!sess) return;
+      sendJson(sess.ws, msg);
+      return;
+    }
+
+    if (msg.type === "term.rename") {
+      const sess = sessions.get(msg.sessionId);
+      if (!sess) return;
+      const next = msg.title.trim().slice(0, 64);
+      if (!next) return;
+      sess.info.title = next;
+      sess.info.customTitle = true;
+      broadcastSessionList();
+      return;
+    }
+
+    if (msg.type === "term.paste_image") {
+      const sess = sessions.get(msg.sessionId);
+      if (!sess || sess.ws.readyState !== WebSocket.OPEN) return;
+      // Forward base64 image payload to target host agent (capped by webWss 16MB maxPayload)
       sendJson(sess.ws, msg);
     }
   });

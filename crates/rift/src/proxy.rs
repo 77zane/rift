@@ -44,10 +44,114 @@ impl Drop for RawModeGuard {
     }
 }
 
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => (b - b'A') as u32,
+            b'a'..=b'z' => (b - b'a' + 26) as u32,
+            b'0'..=b'9' => (b - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' | b'\r' | b'\n' | b' ' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn cleanup_old_uploads() {
+    let Some(dir) = dirs::home_dir().map(|h| h.join(".rift").join("uploads")) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let max_age = Duration::from_secs(7 * 24 * 3600);
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with("paste-") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(modified) = meta.modified() {
+                if now.duration_since(modified).unwrap_or_default() > max_age {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+}
+
+fn save_pasted_image(mime: &str, data_b64: &str) -> Option<String> {
+    let bytes = decode_base64(data_b64)?;
+    if bytes.is_empty() || bytes.len() > 12 * 1024 * 1024 {
+        return None;
+    }
+    let ext = match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => "png",
+    };
+    let dir = dirs::home_dir()?.join(".rift").join("uploads");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let rand_suffix: u16 = rand::thread_rng().gen();
+    let file_path = dir.join(format!("paste-{ts}-{rand_suffix:04x}.{ext}"));
+    std::fs::write(&file_path, bytes).ok()?;
+    Some(file_path.to_string_lossy().to_string())
+}
+
 fn gen_session_id() -> String {
     let mut rng = rand::thread_rng();
     let bytes: [u8; 6] = rng.gen();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn default_dir_title(cwd: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        if Path::new(cwd) == home {
+            return "~".to_string();
+        }
+    }
+    Path::new(cwd)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cwd.to_string())
+}
+
+fn is_generic_shell_title(title: &str) -> bool {
+    let lower = title.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "pwsh"
+            | "pwsh.exe"
+            | "powershell"
+            | "powershell.exe"
+            | "windows powershell"
+            | "cmd"
+            | "cmd.exe"
+            | "command prompt"
+            | "bash"
+            | "zsh"
+            | "sh"
+    )
 }
 
 fn extract_osc_title(chunk: &str) -> Option<String> {
@@ -75,7 +179,6 @@ fn extract_osc_title(chunk: &str) -> Option<String> {
                 if let Ok(raw) = std::str::from_utf8(&bytes[start..end]) {
                     let mut title = raw.trim().to_string();
                     if !title.is_empty() {
-                        // Shorten full Windows .exe paths like C:\Program Files\...\pwsh.exe -> pwsh.exe
                         if title.len() > 6
                             && title.as_bytes()[1] == b':'
                             && title.to_ascii_lowercase().ends_with(".exe")
@@ -84,7 +187,9 @@ fn extract_osc_title(chunk: &str) -> Option<String> {
                                 title = name.to_string_lossy().to_string();
                             }
                         }
-                        last = Some(title);
+                        if !is_generic_shell_title(&title) {
+                            last = Some(title);
+                        }
                     }
                 }
                 i = end + 1;
@@ -103,6 +208,7 @@ enum OutboundEvent {
 }
 
 pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
+    std::thread::spawn(cleanup_old_uploads);
     let session_id = gen_session_id();
     let shell_bin = opts
         .command
@@ -166,9 +272,10 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
     ));
     let pty_master = Arc::new(Mutex::new(pair.master));
 
-    let ring = Arc::new(Mutex::new(ByteRingBuffer::new(256 * 1024)));
+    let ring = Arc::new(Mutex::new(ByteRingBuffer::new(2 * 1024 * 1024)));
+    let default_title = default_dir_title(&cwd);
     let current_title = Arc::new(Mutex::new(
-        opts.title.clone().unwrap_or_else(|| shell_label.clone()),
+        opts.title.clone().unwrap_or_else(|| default_title.clone()),
     ));
     let current_size = Arc::new(Mutex::new((init_cols, init_rows)));
     let shutting_down = Arc::new(AtomicBool::new(false));
@@ -318,6 +425,7 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                         cwd: cwd.clone(),
                         cols,
                         rows,
+                        headless: opts.no_local,
                         secret: if cfg.secret.is_empty() {
                             None
                         } else {
@@ -441,6 +549,21 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                                                     let _ = killer.kill();
                                                     shutting_for_ws.store(true, Ordering::Relaxed);
                                                     break;
+                                                }
+                                                ControlMessage::TermPasteImage { session_id, mime, data }
+                                                    if session_id == sid_for_ws =>
+                                                {
+                                                    if let Some(saved_path) = save_pasted_image(&mime, &data) {
+                                                        let to_write = if saved_path.contains(' ') {
+                                                            format!("\"{saved_path}\" ")
+                                                        } else {
+                                                            format!("{saved_path} ")
+                                                        };
+                                                        if let Ok(mut w) = writer_for_ws.lock() {
+                                                            let _ = w.write_all(to_write.as_bytes());
+                                                            let _ = w.flush();
+                                                        }
+                                                    }
                                                 }
                                                 _ => {}
                                             }

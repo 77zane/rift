@@ -21,6 +21,8 @@ export interface SessionInfo {
   rows: number;
   createdAt: number;
   lastActiveAt: number;
+  headless?: boolean;
+  customTitle?: boolean;
   agentName?: string;
   agentState?: AgentState;
   agentUpdatedAt?: number;
@@ -52,6 +54,7 @@ export type ControlMessage =
       cwd: string;
       cols: number;
       rows: number;
+      headless?: boolean;
       secret?: string;
     }
   | {
@@ -92,6 +95,12 @@ export type ControlMessage =
   | {
       type: "web.attach";
       sessionId: string;
+      sinceSeq?: number;
+    }
+  | {
+      type: "web.sync";
+      sessionId: string;
+      seq: number;
     }
   | {
       type: "web.detach";
@@ -112,6 +121,17 @@ export type ControlMessage =
   | {
       type: "term.close";
       sessionId: string;
+    }
+  | {
+      type: "term.rename";
+      sessionId: string;
+      title: string;
+    }
+  | {
+      type: "term.paste_image";
+      sessionId: string;
+      mime: string;
+      data: string;
     }
   | {
       type: "error";
@@ -158,19 +178,29 @@ export function decodeBinaryFrame(
 }
 
 /**
- * Bounded byte ring buffer for instant terminal replay on viewer attach / reconnect.
+ * Bounded byte ring buffer for instant terminal replay and incremental delta sync.
  */
 export class ByteRingBuffer {
   private chunks: Uint8Array[] = [];
   private totalBytes = 0;
+  private totalWritten = 0;
 
-  constructor(private readonly maxBytes = 256 * 1024) {}
+  constructor(private readonly maxBytes = 4 * 1024 * 1024) {}
+
+  get headOffset(): number {
+    return this.totalWritten;
+  }
+
+  get tailOffset(): number {
+    return this.totalWritten - this.totalBytes;
+  }
 
   push(chunk: Uint8Array): void {
     if (chunk.length === 0) return;
     const copy = new Uint8Array(chunk);
     this.chunks.push(copy);
     this.totalBytes += copy.length;
+    this.totalWritten += copy.length;
     while (this.totalBytes > this.maxBytes && this.chunks.length > 0) {
       const removed = this.chunks.shift()!;
       this.totalBytes -= removed.length;
@@ -178,12 +208,38 @@ export class ByteRingBuffer {
   }
 
   replace(data: Uint8Array): void {
-    this.clear();
+    this.chunks = [];
+    this.totalBytes = 0;
+    // Advance offset past any previous viewer's sinceSeq so stale viewers trigger full replay
+    this.totalWritten += this.maxBytes + 1;
     if (data.length <= this.maxBytes) {
       this.push(data);
     } else {
       this.push(data.subarray(data.length - this.maxBytes));
     }
+  }
+
+  sliceSince(offset: number): Uint8Array | null {
+    if (offset < this.tailOffset || offset > this.totalWritten) {
+      return null;
+    }
+    const needed = this.totalWritten - offset;
+    if (needed === 0) return new Uint8Array(0);
+
+    const out = new Uint8Array(needed);
+    let skip = offset - this.tailOffset;
+    let outPos = 0;
+    for (const c of this.chunks) {
+      if (skip >= c.length) {
+        skip -= c.length;
+        continue;
+      }
+      const part = skip > 0 ? c.subarray(skip) : c;
+      skip = 0;
+      out.set(part, outPos);
+      outPos += part.length;
+    }
+    return out;
   }
 
   snapshot(): Uint8Array {
