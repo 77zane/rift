@@ -120,6 +120,51 @@ term.onData((data) => {
   sendTerminalInput(data);
 });
 
+// Enable native paste & voice-IME dictation (Typeless, Wispr Flow, Windows Voice Typing, etc.):
+// By default on Windows/Linux, xterm.js swallows Ctrl+V as raw ^V (\x16) instead of triggering browser paste.
+term.attachCustomKeyEventHandler((ev: KeyboardEvent) => {
+  const key = ev.key.toLowerCase();
+  const mod = ev.ctrlKey || ev.metaKey;
+
+  // Allow native paste (Ctrl+V, Ctrl+Shift+V, Cmd+V)
+  if (mod && !ev.altKey && key === "v") {
+    return false;
+  }
+
+  // Allow native copy (Cmd+C, Ctrl+Shift+C, or Ctrl+C when terminal has a selection)
+  if (mod && !ev.altKey && key === "c") {
+    if (ev.metaKey || ev.shiftKey || term.hasSelection()) {
+      return false;
+    }
+  }
+
+  return true;
+});
+
+// Fallback paste listener: if focus is on the terminal area (not an input/textarea outside xterm),
+// still route clipboard dictation/paste cleanly into xterm.
+window.addEventListener("paste", (ev: ClipboardEvent) => {
+  const target = ev.target as HTMLElement | null;
+  if (
+    target &&
+    (target === composerInput ||
+      target === authInputEl ||
+      (target.tagName === "INPUT" && target !== term.textarea) ||
+      (target.tagName === "TEXTAREA" && target !== term.textarea))
+  ) {
+    return;
+  }
+  // If xterm's own textarea is focused, xterm handles the native paste event itself.
+  if (target === term.textarea) return;
+
+  const text = ev.clipboardData?.getData("text/plain");
+  if (text && activeSessionId) {
+    ev.preventDefault();
+    term.paste(text);
+    term.focus();
+  }
+});
+
 function findSession(id: string | null): SessionInfo | null {
   if (!id) return null;
   for (const h of hosts) {
