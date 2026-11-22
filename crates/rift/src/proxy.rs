@@ -1,0 +1,477 @@
+use crate::config::{default_shell, normalize_ws_url, platform_tag, RiftConfig};
+use crate::daemon::spawn_detached_session;
+use crate::protocol::{
+    decode_binary_frame, encode_binary_frame, ByteRingBuffer, ControlMessage, FRAME_PTY_INPUT,
+    FRAME_PTY_OUTPUT, FRAME_PTY_REPLAY,
+};
+use anyhow::{Context, Result};
+use futures_util::{SinkExt, StreamExt};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use rand::Rng;
+use std::io::{IsTerminal, Read, Write};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+pub struct ProxyRunOptions {
+    pub config: RiftConfig,
+    pub title: Option<String>,
+    pub no_local: bool,
+    pub cols: Option<u16>,
+    pub rows: Option<u16>,
+    pub command: Vec<String>,
+}
+
+struct RawModeGuard(bool);
+
+impl RawModeGuard {
+    fn enter(enable: bool) -> Self {
+        if enable {
+            let _ = crossterm::terminal::enable_raw_mode();
+        }
+        Self(enable)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+}
+
+fn gen_session_id() -> String {
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 6] = rng.gen();
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn extract_osc_title(chunk: &str) -> Option<String> {
+    let bytes = chunk.as_bytes();
+    let mut i = 0;
+    let mut last: Option<String> = None;
+    while i + 4 < bytes.len() {
+        if bytes[i] == 0x1b
+            && bytes[i + 1] == b']'
+            && (bytes[i + 2] == b'0' || bytes[i + 2] == b'2')
+            && bytes[i + 3] == b';'
+        {
+            let start = i + 4;
+            let mut end = start;
+            while end < bytes.len() && end - start < 220 {
+                if bytes[end] == 0x07 {
+                    break;
+                }
+                if bytes[end] == 0x1b && end + 1 < bytes.len() && bytes[end + 1] == b'\\' {
+                    break;
+                }
+                end += 1;
+            }
+            if end < bytes.len() {
+                if let Ok(raw) = std::str::from_utf8(&bytes[start..end]) {
+                    let mut title = raw.trim().to_string();
+                    if !title.is_empty() {
+                        // Shorten full Windows .exe paths like C:\Program Files\...\pwsh.exe -> pwsh.exe
+                        if title.len() > 6
+                            && title.as_bytes()[1] == b':'
+                            && title.to_ascii_lowercase().ends_with(".exe")
+                        {
+                            if let Some(name) = Path::new(&title).file_name() {
+                                title = name.to_string_lossy().to_string();
+                            }
+                        }
+                        last = Some(title);
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    last
+}
+
+enum OutboundEvent {
+    Output(Vec<u8>),
+    Title(String),
+    Size(u16, u16),
+}
+
+pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
+    let session_id = gen_session_id();
+    let shell_bin = opts
+        .command
+        .first()
+        .cloned()
+        .unwrap_or_else(|| default_shell(&opts.config.shell));
+    let shell_args: Vec<String> = if opts.command.len() > 1 {
+        opts.command[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    let shell_label = Path::new(&shell_bin)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| shell_bin.clone());
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+
+    let local_tty = !opts.no_local && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let (detected_cols, detected_rows) = if local_tty {
+        crossterm::terminal::size().unwrap_or((120, 32))
+    } else {
+        (120, 32)
+    };
+    let init_cols = opts.cols.unwrap_or(detected_cols).max(20);
+    let init_rows = opts.rows.unwrap_or(detected_rows).max(5);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: init_rows,
+            cols: init_cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("创建系统 PTY 失败")?;
+
+    let mut cmd = CommandBuilder::new(&shell_bin);
+    for a in &shell_args {
+        cmd.arg(a);
+    }
+    cmd.cwd(&cwd);
+    cmd.env("RIFT_SESSION_ID", &session_id);
+    cmd.env("RIFT_HOST", &opts.config.host);
+    if std::env::var_os("TERM").is_none() {
+        cmd.env("TERM", "xterm-256color");
+    }
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .with_context(|| format!("启动终端失败: {shell_bin}"))?;
+    let mut killer = child.clone_killer();
+    drop(pair.slave);
+
+    let mut pty_reader = pair.master.try_clone_reader().context("克隆 PTY 读取端失败")?;
+    let pty_writer = Arc::new(Mutex::new(
+        pair.master.take_writer().context("获取 PTY 写入端失败")?,
+    ));
+    let pty_master = Arc::new(Mutex::new(pair.master));
+
+    let ring = Arc::new(Mutex::new(ByteRingBuffer::new(256 * 1024)));
+    let current_title = Arc::new(Mutex::new(
+        opts.title.clone().unwrap_or_else(|| shell_label.clone()),
+    ));
+    let current_size = Arc::new(Mutex::new((init_cols, init_rows)));
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundEvent>();
+
+    let _raw_guard = RawModeGuard::enter(local_tty);
+
+    // 1. PTY output -> local stdout + RingBuffer + Relay channel
+    {
+        let ring = Arc::clone(&ring);
+        let current_title = Arc::clone(&current_title);
+        let out_tx = out_tx.clone();
+        let no_local = opts.no_local;
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            let mut stdout = std::io::stdout();
+            while let Ok(n) = pty_reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let slice = &buf[..n];
+                if !no_local {
+                    let _ = stdout.write_all(slice);
+                    let _ = stdout.flush();
+                }
+                if let Ok(mut rb) = ring.lock() {
+                    rb.push(slice);
+                }
+                let text = String::from_utf8_lossy(slice);
+                if let Some(new_title) = extract_osc_title(&text) {
+                    let mut changed = false;
+                    if let Ok(mut t) = current_title.lock() {
+                        if *t != new_title {
+                            *t = new_title.clone();
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        let _ = out_tx.send(OutboundEvent::Title(new_title));
+                    }
+                }
+                let _ = out_tx.send(OutboundEvent::Output(slice.to_vec()));
+            }
+        });
+    }
+
+    // 2. Local stdin -> PTY writer
+    if local_tty {
+        {
+            let pty_writer = Arc::clone(&pty_writer);
+            let shutting_down = Arc::clone(&shutting_down);
+            std::thread::spawn(move || {
+                let mut stdin = std::io::stdin();
+                let mut buf = [0u8; 1024];
+                while !shutting_down.load(Ordering::Relaxed) {
+                    match stdin.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut w) = pty_writer.lock() {
+                                let _ = w.write_all(&buf[..n]);
+                                let _ = w.flush();
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // 3. Local terminal resize poller (250ms)
+        {
+            let pty_master = Arc::clone(&pty_master);
+            let current_size = Arc::clone(&current_size);
+            let shutting_down = Arc::clone(&shutting_down);
+            let out_tx = out_tx.clone();
+            std::thread::spawn(move || {
+                while !shutting_down.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(250));
+                    if let Ok((cols, rows)) = crossterm::terminal::size() {
+                        if cols >= 20 && rows >= 5 {
+                            let mut changed = false;
+                            if let Ok(mut sz) = current_size.lock() {
+                                if sz.0 != cols || sz.1 != rows {
+                                    *sz = (cols, rows);
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                if let Ok(m) = pty_master.lock() {
+                                    let _ = m.resize(PtySize {
+                                        rows,
+                                        cols,
+                                        pixel_width: 0,
+                                        pixel_height: 0,
+                                    });
+                                }
+                                let _ = out_tx.send(OutboundEvent::Size(cols, rows));
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // 4. Child exit watcher
+    let (exit_tx, exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    std::thread::spawn(move || {
+        let code = child
+            .wait()
+            .map(|s| s.exit_code() as i32)
+            .unwrap_or(0);
+        let _ = exit_tx.send(code);
+    });
+
+    // 5. Async WebSocket relay loop (never kills local shell on network error)
+    let ws_url = normalize_ws_url(&opts.config.relay, "/ws/agent");
+    let cfg = opts.config.clone();
+    let sid_for_ws = session_id.clone();
+    let ring_for_ws = Arc::clone(&ring);
+    let title_for_ws = Arc::clone(&current_title);
+    let size_for_ws = Arc::clone(&current_size);
+    let writer_for_ws = Arc::clone(&pty_writer);
+    let master_for_ws = Arc::clone(&pty_master);
+    let shutting_for_ws = Arc::clone(&shutting_down);
+
+    let ws_task = tokio::spawn(async move {
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if shutting_for_ws.load(Ordering::Relaxed) {
+                break;
+            }
+            match connect_async(&ws_url).await {
+                Ok((ws_stream, _)) => {
+                    backoff = Duration::from_secs(1);
+                    let (mut write, mut read) = ws_stream.split();
+                    let (cols, rows) = size_for_ws.lock().map(|s| *s).unwrap_or((init_cols, init_rows));
+                    let title = title_for_ws.lock().map(|t| t.clone()).unwrap_or_else(|_| shell_label.clone());
+
+                    let reg = ControlMessage::AgentRegister {
+                        host_id: cfg.host.clone(),
+                        host_name: cfg.host.clone(),
+                        platform: platform_tag().to_string(),
+                        session_id: sid_for_ws.clone(),
+                        title,
+                        shell: shell_label.clone(),
+                        cwd: cwd.clone(),
+                        cols,
+                        rows,
+                        secret: if cfg.secret.is_empty() {
+                            None
+                        } else {
+                            Some(cfg.secret.clone())
+                        },
+                    };
+                    if let Ok(txt) = serde_json::to_string(&reg) {
+                        if write.send(Message::Text(txt.into())).await.is_err() {
+                            tokio::time::sleep(backoff).await;
+                            continue;
+                        }
+                    }
+
+                    // Upload Ring Buffer snapshot so relay restores screen even after relay restart
+                    let snap = ring_for_ws.lock().map(|rb| rb.snapshot()).unwrap_or_default();
+                    if !snap.is_empty() {
+                        let frame = encode_binary_frame(FRAME_PTY_REPLAY, &sid_for_ws, &snap);
+                        let _ = write.send(Message::Binary(frame.into())).await;
+                    }
+
+                    let mut hb = tokio::time::interval(Duration::from_secs(15));
+                    loop {
+                        tokio::select! {
+                            _ = hb.tick() => {
+                                let msg = ControlMessage::AgentHeartbeat { session_id: sid_for_ws.clone() };
+                                if let Ok(txt) = serde_json::to_string(&msg) {
+                                    if write.send(Message::Text(txt.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            ev = out_rx.recv() => {
+                                match ev {
+                                    Some(OutboundEvent::Output(bytes)) => {
+                                        let frame = encode_binary_frame(FRAME_PTY_OUTPUT, &sid_for_ws, &bytes);
+                                        if write.send(Message::Binary(frame.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(OutboundEvent::Title(t)) => {
+                                        let msg = ControlMessage::AgentUpdate {
+                                            session_id: sid_for_ws.clone(),
+                                            title: Some(t),
+                                            cwd: None,
+                                            cols: None,
+                                            rows: None,
+                                        };
+                                        if let Ok(txt) = serde_json::to_string(&msg) {
+                                            let _ = write.send(Message::Text(txt.into())).await;
+                                        }
+                                    }
+                                    Some(OutboundEvent::Size(c, r)) => {
+                                        let msg = ControlMessage::AgentUpdate {
+                                            session_id: sid_for_ws.clone(),
+                                            title: None,
+                                            cwd: None,
+                                            cols: Some(c),
+                                            rows: Some(r),
+                                        };
+                                        if let Ok(txt) = serde_json::to_string(&msg) {
+                                            let _ = write.send(Message::Text(txt.into())).await;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            incoming = read.next() => {
+                                match incoming {
+                                    Some(Ok(Message::Binary(bin))) => {
+                                        if let Some((ftype, sid, payload)) = decode_binary_frame(&bin) {
+                                            if ftype == FRAME_PTY_INPUT && sid == sid_for_ws {
+                                                if let Ok(mut w) = writer_for_ws.lock() {
+                                                    let _ = w.write_all(payload);
+                                                    let _ = w.flush();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(Message::Text(txt))) => {
+                                        if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&txt) {
+                                            match ctrl {
+                                                ControlMessage::TermResize { session_id, cols, rows }
+                                                    if session_id == sid_for_ws =>
+                                                {
+                                                    if let Ok(mut sz) = size_for_ws.lock() {
+                                                        *sz = (cols, rows);
+                                                    }
+                                                    if let Ok(m) = master_for_ws.lock() {
+                                                        let _ = m.resize(PtySize {
+                                                            rows,
+                                                            cols,
+                                                            pixel_width: 0,
+                                                            pixel_height: 0,
+                                                        });
+                                                    }
+                                                    let upd = ControlMessage::AgentUpdate {
+                                                        session_id: sid_for_ws.clone(),
+                                                        title: None,
+                                                        cwd: None,
+                                                        cols: Some(cols),
+                                                        rows: Some(rows),
+                                                    };
+                                                    if let Ok(s) = serde_json::to_string(&upd) {
+                                                        let _ = write.send(Message::Text(s.into())).await;
+                                                    }
+                                                }
+                                                ControlMessage::HostSpawn { host_id, shell, cwd: req_cwd }
+                                                    if host_id == cfg.host =>
+                                                {
+                                                    spawn_detached_session(
+                                                        &cfg.relay,
+                                                        &cfg.host,
+                                                        &cfg.secret,
+                                                        shell,
+                                                        req_cwd,
+                                                    );
+                                                }
+                                                ControlMessage::TermClose { session_id }
+                                                    if session_id == sid_for_ws =>
+                                                {
+                                                    let _ = killer.kill();
+                                                    shutting_for_ws.store(true, Ordering::Relaxed);
+                                                    break;
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+                                    Some(Ok(Message::Ping(p))) => {
+                                        let _ = write.send(Message::Pong(p)).await;
+                                    }
+                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Drain queued output while offline so memory stays bounded
+                    while out_rx.try_recv().is_ok() {}
+                }
+            }
+
+            if shutting_for_ws.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
+    });
+
+    let exit_code = exit_rx.await.unwrap_or(0);
+    shutting_down.store(true, Ordering::Relaxed);
+    ws_task.abort();
+    Ok(exit_code)
+}

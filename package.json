@@ -1,0 +1,17 @@
+{
+  "name": "rift",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @rift/shared && npm run build -w @rift/relay && npm run build -w @rift/agent && npm run build -w @rift/web",
+    "typecheck": "npm run build -w @rift/shared && npm run typecheck -w @rift/relay && npm run typecheck -w @rift/agent && npm run typecheck -w @rift/web",
+    "relay": "node packages/relay/dist/index.js",
+    "agent": "node packages/agent/dist/index.js",
+    "attach": "node packages/agent/dist/index.js attach",
+    "test:e2e": "node scripts/e2e-verify.mjs"
+  }
+}

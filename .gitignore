@@ -1,0 +1,12 @@
+node_modules/
+dist/
+crates/*/target/
+target/
+.cargo/
+*.log
+.env
+.env.*
+zellij.exe
+zellij-terminal.exe
+.DS_Store
+Thumbs.db

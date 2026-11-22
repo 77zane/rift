@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="ember">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Rift // terminal mirror</title>
+  </head>
+  <body>
+    <div id="app" class="app">
+      <div id="sidebar-backdrop" class="sidebar-backdrop hidden"></div>
+
+      <aside id="sidebar" class="sidebar">
+        <div class="sidebar-header">
+          <div class="brand">
+            <span class="brand-dot" id="conn-dot"></span>
+            <span class="brand-bracket">[</span>
+            <span class="brand-name">rift</span>
+            <span class="brand-bracket">]</span>
+          </div>
+          <span class="conn-label" id="conn-label">INIT</span>
+        </div>
+
+        <div class="sidebar-section-label">
+          <span>NODES // SESSIONS</span>
+          <span id="session-count" class="count-badge">0</span>
+        </div>
+
+        <div id="host-list" class="host-list"></div>
+
+        <div class="sidebar-footer">
+          <span class="footer-hint">RAW PTY · LIVE MIRROR</span>
+          <button id="btn-theme" class="theme-chip" title="切换风格：EMBER（余烬暖炭）/ PHOSPHOR（磷光黑客绿）">
+            EMBER
+          </button>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-left">
+            <button id="btn-sidebar" class="icon-btn" title="展开/收起侧边栏">☰</button>
+            <div class="active-title" id="active-title">NO ACTIVE SESSION</div>
+          </div>
+          <div class="topbar-right">
+            <button
+              id="btn-size-mode"
+              class="pill-btn"
+              title="切换尺寸模式：跟随主机不挤乱电脑排版；适配本机同步当前窗口列宽"
+            >
+              [ 跟随主机 ]
+            </button>
+            <button id="btn-mobile-bar" class="pill-btn" title="显示/隐藏快捷按键与发送框">
+              [ ⌨ ]
+            </button>
+          </div>
+        </header>
+
+        <section class="terminal-wrap" id="terminal-wrap">
+          <div id="empty-state" class="empty-state">
+            <div class="empty-ascii">┌─ RIFT READY ─┐</div>
+            <div class="empty-title">等待本地终端接入…</div>
+            <div class="empty-desc">
+              在任意主机终端执行 <code>rift</code>（或 <code>rift daemon</code>），节点将自动上线并实时同屏。
+            </div>
+          </div>
+          <div id="terminal-container" class="terminal-container hidden"></div>
+        </section>
+
+        <footer id="mobile-bar" class="mobile-bar hidden">
+          <div class="quick-keys">
+            <button class="qkey" data-key="esc">esc</button>
+            <button class="qkey" data-key="tab">tab</button>
+            <button class="qkey qkey-danger" data-key="ctrl-c">^C</button>
+            <button class="qkey" data-key="up">↑</button>
+            <button class="qkey" data-key="down">↓</button>
+            <button class="qkey" data-key="left">←</button>
+            <button class="qkey" data-key="right">→</button>
+            <button class="qkey" data-key="enter">⏎</button>
+            <button class="qkey" data-key="clear">clr</button>
+          </div>
+          <form id="composer-form" class="composer-form">
+            <span class="composer-prompt">&gt;</span>
+            <input
+              id="composer-input"
+              class="composer-input"
+              type="text"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="输入中文或指令，回车直接注入 PTY…"
+            />
+            <button type="submit" class="send-btn">SEND ⏎</button>
+          </form>
+        </footer>
+      </main>
+    </div>
+
+    <div id="auth-modal" class="auth-modal hidden">
+      <form id="auth-form" class="auth-card">
+        <div class="auth-tag">AUTH // ACCESS REQUIRED</div>
+        <h2>验证访问密钥</h2>
+        <p>中转节点已开启鉴权保护，请输入 <code>WEB_TOKEN</code> 解锁会话：</p>
+        <input id="auth-input" type="password" placeholder="enter access token..." required />
+        <div id="auth-error" class="auth-error"></div>
+        <button type="submit" class="send-btn">CONNECT ⏎</button>
+      </form>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
