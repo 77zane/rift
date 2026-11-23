@@ -47,8 +47,24 @@ fn install_binary() -> Result<PathBuf> {
         .unwrap_or(false);
 
     if !same {
-        // On Windows, if an old daemon holds target, copy may fail; try copy and fall back to current if locked
+        // On Windows, running executables cannot be overwritten in-place, but can be renamed aside.
+        #[cfg(windows)]
+        {
+            stop_windows_daemon();
+            if target.exists() {
+                let backup = target.with_extension("exe.old");
+                let _ = fs::remove_file(&backup);
+                let _ = fs::rename(&target, &backup);
+            }
+        }
         if let Err(e) = fs::copy(&current, &target) {
+            #[cfg(windows)]
+            {
+                let backup = target.with_extension("exe.old");
+                if !target.exists() && backup.exists() {
+                    let _ = fs::rename(&backup, &target);
+                }
+            }
             eprintln!(
                 "[rift setup] 提示：更新 {} 失败（可能正被运行中进程占用: {e}），将继续使用已有路径。",
                 target.display()
@@ -316,11 +332,11 @@ fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
                 "PreInvocation": [
                     { "type": "command", "command": make_cmd("running", None), "timeout": 3 }
                 ],
-                "PreToolUse": [
+                "PostToolUse": [
                     {
                         "matcher": "*",
                         "hooks": [
-                            { "type": "command", "command": make_cmd("tool", Some("ask")), "timeout": 3 }
+                            { "type": "command", "command": make_cmd("tool", None), "timeout": 3 }
                         ]
                     }
                 ],
@@ -348,11 +364,11 @@ fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
         if let Some(obj) = root.as_object_mut() {
             let hooks_val = obj.entry("hooks").or_insert_with(|| json!({}));
             if let Some(hooks_obj) = hooks_val.as_object_mut() {
-                for (hook_name, ev) in [
-                    ("UserPromptSubmit", "running"),
-                    ("PreToolUse", "tool"),
-                    ("Notification", "waiting"),
-                    ("Stop", "idle"),
+                for (hook_name, matcher, ev) in [
+                    ("UserPromptSubmit", "*", "running"),
+                    ("PreToolUse", "*", "tool"),
+                    ("Notification", "permission_prompt|elicitation_dialog", "waiting"),
+                    ("Stop", "*", "idle"),
                 ] {
                     let arr = hooks_obj
                         .entry(hook_name)
@@ -362,7 +378,7 @@ fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
                         // Remove any prior rift agent-hook entry before inserting fresh one
                         list.retain(|item| !item.to_string().contains("agent-hook --agent claude"));
                         list.push(json!({
-                            "matcher": "*",
+                            "matcher": matcher,
                             "hooks": [
                                 {
                                     "type": "command",
@@ -419,10 +435,39 @@ fn uninstall_agent_hooks() -> Result<Vec<String>> {
     Ok(removed)
 }
 
+#[cfg(windows)]
+fn stop_windows_daemon() {
+    let _ = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'rift.exe' -and $_.CommandLine -match 'daemon' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn install_autostart_and_launch(exe: &Path) -> Result<String> {
     #[cfg(windows)]
     {
-        let cmd_val = format!("\"{}\" daemon", exe.to_string_lossy());
+        let home = dirs::home_dir().context("无法获取用户主目录")?;
+        let vbs_path = home.join(".rift").join("start-daemon.vbs");
+        if let Some(parent) = vbs_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let exe_escaped = exe.to_string_lossy().replace('"', "\"\"");
+        let vbs_body = format!(
+            "Set sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"{exe_escaped}\"\" daemon\", 0, False\r\n"
+        );
+        fs::write(&vbs_path, vbs_body)?;
+
+        let cmd_val = format!(
+            "wscript.exe //B //Nologo \"{}\"",
+            vbs_path.to_string_lossy()
+        );
         let _ = Command::new("reg.exe")
             .args([
                 "add",
@@ -439,7 +484,10 @@ fn install_autostart_and_launch(exe: &Path) -> Result<String> {
             .stderr(Stdio::null())
             .status();
 
-        // Launch daemon immediately in background
+        // Replace any existing daemon instance so we never leave duplicates or stale binaries
+        stop_windows_daemon();
+
+        // Launch daemon immediately in background (no console window)
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         const DETACHED_PROCESS: u32 = 0x00000008;
@@ -451,7 +499,7 @@ fn install_autostart_and_launch(exe: &Path) -> Result<String> {
             .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
             .spawn();
 
-        Ok("Windows 用户级开机自启 (HKCU\\...\\Run\\RiftDaemon) + 已立即后台启动".to_string())
+        Ok("Windows 用户级静默开机自启 (wscript + start-daemon.vbs，无黑框) + 已立即后台启动".to_string())
     }
 
     #[cfg(not(windows))]
@@ -501,18 +549,10 @@ fn uninstall_autostart() -> Result<bool> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        // Stop any running `rift.exe daemon` process
-        let _ = Command::new("powershell.exe")
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'rift.exe' -and $_.CommandLine -match 'daemon' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        if let Some(home) = dirs::home_dir() {
+            let _ = fs::remove_file(home.join(".rift").join("start-daemon.vbs"));
+        }
+        stop_windows_daemon();
         Ok(true)
     }
 

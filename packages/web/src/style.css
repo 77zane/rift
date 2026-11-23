@@ -510,6 +510,14 @@ body {
   height: 100%;
 }
 
+.session-term-pane .xterm {
+  line-height: normal;
+}
+
+.session-term-pane .xterm-viewport {
+  overscroll-behavior: contain;
+}
+
 .empty-state {
   height: 100%;
   display: flex;

@@ -3,6 +3,7 @@ import "./style.css";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
+import { WebglAddon } from "@xterm/addon-webgl";
 import {
   FRAME_PTY_INPUT,
   FRAME_PTY_OUTPUT,
@@ -58,10 +59,12 @@ let toastTimer: number | null = null;
 //   - Remote `+` (headless) sessions -> "fit-local" (fills 100% of browser screen!)
 //   - Local desktop (WT/Ghostty) sessions -> "follow-host" (never squishes local desktop layout!)
 const sizeModeOverrides = new Map<string, "follow-host" | "fit-local">();
+const lastHostSizes = new Map<string, { cols: number; rows: number }>();
 let sizeMode: "follow-host" | "fit-local" = "follow-host";
 let mobileBarVisible = isMobileViewport();
 let reconnectTimer: number | null = null;
 let needsReattach = false;
+let relayBootId: string | null = null;
 let authToken = localStorage.getItem("rift_token") ?? localStorage.getItem("agentshare_token") ?? "";
 
 let themeName: "ember" | "phosphor" =
@@ -104,6 +107,7 @@ interface SessionTerminal {
   pane: HTMLDivElement;
   decoder: TextDecoder;
   lastSeq: number | null;
+  webglAddon: WebglAddon | null;
 }
 
 const sessionTerms = new Map<string, SessionTerminal>();
@@ -119,7 +123,7 @@ function getOrCreateSessionTerm(sessionId: string): SessionTerminal {
   const term = new Terminal({
     cursorBlink: true,
     fontSize: isMobileViewport() ? 12 : 15,
-    lineHeight: 1.15,
+    lineHeight: isMobileViewport() ? 1.25 : 1.2,
     fontFamily: '"JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace',
     scrollback: 10000,
     theme: XTERM_THEMES[themeName],
@@ -185,9 +189,41 @@ function getOrCreateSessionTerm(sessionId: string): SessionTerminal {
     pane,
     decoder: new TextDecoder(),
     lastSeq: null,
+    webglAddon: null,
   };
   sessionTerms.set(sessionId, entry);
   return entry;
+}
+
+function enableWebglFor(entry: SessionTerminal): void {
+  if (entry.webglAddon) return;
+  try {
+    const webgl = new WebglAddon();
+    webgl.onContextLoss(() => {
+      try {
+        webgl.dispose();
+      } catch {
+        // ignore
+      }
+      if (entry.webglAddon === webgl) {
+        entry.webglAddon = null;
+      }
+    });
+    entry.term.loadAddon(webgl);
+    entry.webglAddon = webgl;
+  } catch {
+    // WebGL unavailable; gracefully stay on DOM renderer
+  }
+}
+
+function disableWebglFor(entry: SessionTerminal): void {
+  if (!entry.webglAddon) return;
+  try {
+    entry.webglAddon.dispose();
+  } catch {
+    // ignore
+  }
+  entry.webglAddon = null;
 }
 
 function getActiveSessionTerm(): SessionTerminal | null {
@@ -197,6 +233,7 @@ function getActiveSessionTerm(): SessionTerminal | null {
 function disposeStaleSessionTerms(validIds: Set<string>): void {
   for (const [id, entry] of sessionTerms) {
     if (!validIds.has(id)) {
+      disableWebglFor(entry);
       entry.term.dispose();
       entry.pane.remove();
       sessionTerms.delete(id);
@@ -428,7 +465,10 @@ function attachSession(sessionId: string): void {
   }
   if (activeSessionId) {
     const prevEntry = sessionTerms.get(activeSessionId);
-    if (prevEntry) prevEntry.pane.classList.add("hidden");
+    if (prevEntry) {
+      disableWebglFor(prevEntry);
+      prevEntry.pane.classList.add("hidden");
+    }
     sendControl({ type: "web.detach", sessionId: activeSessionId });
   }
   activeSessionId = sessionId;
@@ -439,9 +479,12 @@ function attachSession(sessionId: string): void {
   emptyStateEl.classList.add("hidden");
   termContainerEl.classList.remove("hidden");
   entry.pane.classList.remove("hidden");
+  enableWebglFor(entry);
+  entry.term.refresh(0, entry.term.rows - 1);
 
   const sess = findSession(sessionId);
   if (sess) {
+    lastHostSizes.set(sess.sessionId, { cols: sess.cols, rows: sess.rows });
     sizeMode = resolveSizeModeFor(sess);
     activeTitleEl.textContent = `${sess.hostName} :: ${sess.title}`;
     updateSizeModeUI();
@@ -595,12 +638,32 @@ function renderHostList(): void {
     activeTitleEl.textContent = agentBadge
       ? `${current.hostName} :: ${current.title} [${agentBadge}]`
       : `${current.hostName} :: ${current.title}`;
-    const desired = resolveSizeModeFor(current);
-    if (desired !== sizeMode) {
-      sizeMode = desired;
+
+    // Last-resizer-wins sync: if the host PTY size changed to something different from
+    // our current xterm size (e.g. user resized the local PowerShell window), immediately
+    // switch to follow-host so Web and host stay 100% aligned with zero desync.
+    const prevHost = lastHostSizes.get(current.sessionId);
+    const activeEntry = getActiveSessionTerm();
+    const hostChanged =
+      prevHost !== undefined && (prevHost.cols !== current.cols || prevHost.rows !== current.rows);
+    lastHostSizes.set(current.sessionId, { cols: current.cols, rows: current.rows });
+
+    if (
+      hostChanged &&
+      activeEntry &&
+      (activeEntry.term.cols !== current.cols || activeEntry.term.rows !== current.rows)
+    ) {
+      sizeModeOverrides.set(current.sessionId, "follow-host");
+      sizeMode = "follow-host";
       updateSizeModeUI();
-    } else if (sizeMode === "follow-host") {
-      applyTerminalSize();
+    } else {
+      const desired = resolveSizeModeFor(current);
+      if (desired !== sizeMode) {
+        sizeMode = desired;
+        updateSizeModeUI();
+      } else if (sizeMode === "follow-host") {
+        applyTerminalSize();
+      }
     }
   } else {
     activeSessionId = null;
@@ -682,6 +745,15 @@ function connect(): void {
     if (msg.type === "web.auth_ok") {
       authModalEl.classList.add("hidden");
       authErrorEl.textContent = "";
+      if (msg.bootId) {
+        if (relayBootId && relayBootId !== msg.bootId) {
+          // Relay restarted: invalidate cached byte offsets so reattach triggers a clean full replay
+          for (const entry of sessionTerms.values()) {
+            entry.lastSeq = null;
+          }
+        }
+        relayBootId = msg.bootId;
+      }
       return;
     }
 

@@ -3,7 +3,7 @@ use crate::protocol::ControlMessage;
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 pub fn spawn_detached_session(
@@ -55,8 +55,8 @@ pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
 
     let mut backoff = Duration::from_secs(1);
     loop {
-        match connect_async(&ws_url).await {
-            Ok((ws_stream, _)) => {
+        match tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url)).await {
+            Ok(Ok((ws_stream, _))) => {
                 backoff = Duration::from_secs(1);
                 let (mut write, mut read) = ws_stream.split();
                 let reg = ControlMessage::HostOnline {
@@ -76,35 +76,62 @@ pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
                     }
                 }
 
-                while let Some(Ok(msg)) = read.next().await {
-                    match msg {
-                        Message::Text(txt) => {
-                            if let Ok(ControlMessage::HostSpawn {
-                                host_id,
-                                shell,
-                                cwd,
-                            }) = serde_json::from_str::<ControlMessage>(&txt)
-                            {
-                                if host_id == cfg.host {
-                                    spawn_detached_session(
-                                        &cfg.relay,
-                                        &cfg.host,
-                                        &cfg.secret,
+                let mut last_rx = Instant::now();
+                let mut ping_tick = tokio::time::interval(Duration::from_secs(20));
+                ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                ping_tick.tick().await; // consume immediate first tick
+
+                loop {
+                    tokio::select! {
+                        _ = ping_tick.tick() => {
+                            if last_rx.elapsed() > Duration::from_secs(60) {
+                                // Half-open TCP connection (e.g. after sleep/wake or network switch)
+                                break;
+                            }
+                            if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        incoming = read.next() => {
+                            match incoming {
+                                Some(Ok(Message::Text(txt))) => {
+                                    last_rx = Instant::now();
+                                    if let Ok(ControlMessage::HostSpawn {
+                                        host_id,
                                         shell,
                                         cwd,
-                                    );
+                                    }) = serde_json::from_str::<ControlMessage>(&txt)
+                                    {
+                                        if host_id == cfg.host {
+                                            spawn_detached_session(
+                                                &cfg.relay,
+                                                &cfg.host,
+                                                &cfg.secret,
+                                                shell,
+                                                cwd,
+                                            );
+                                        }
+                                    }
+                                }
+                                Some(Ok(Message::Ping(p))) => {
+                                    last_rx = Instant::now();
+                                    if write.send(Message::Pong(p)).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Some(Ok(Message::Pong(_))) => {
+                                    last_rx = Instant::now();
+                                }
+                                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                Some(Ok(_)) => {
+                                    last_rx = Instant::now();
                                 }
                             }
                         }
-                        Message::Ping(p) => {
-                            let _ = write.send(Message::Pong(p)).await;
-                        }
-                        Message::Close(_) => break,
-                        _ => {}
                     }
                 }
             }
-            Err(_) => {}
+            Ok(Err(_)) | Err(_) => {}
         }
 
         tokio::time::sleep(backoff).await;

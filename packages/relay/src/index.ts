@@ -62,6 +62,7 @@ interface HostDaemon {
 const sessions = new Map<string, AgentSession>();
 const hostDaemons = new Map<string, HostDaemon>();
 const webClients = new Set<WebClient>();
+const RELAY_BOOT_ID = Math.random().toString(36).slice(2, 10);
 
 // Lightweight in-memory brute-force protection for WEB_TOKEN auth (5 fails -> 15 min lock per IP)
 const MAX_AUTH_FAILS = 5;
@@ -235,8 +236,20 @@ function serveStatic(req: http.IncomingMessage, res: http.ServerResponse): void 
 }
 
 const server = http.createServer(serveStatic);
-const agentWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
-const webWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 * 1024 });
+const wsDeflate = {
+  threshold: 1024,
+  zlibDeflateOptions: { level: 3 },
+};
+const agentWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 16 * 1024 * 1024,
+  perMessageDeflate: wsDeflate,
+});
+const webWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 16 * 1024 * 1024,
+  perMessageDeflate: wsDeflate,
+});
 
 server.on("upgrade", (req, socket, head) => {
   const reqUrl = new URL(req.url ?? "/", `http://${req.headers.host ?? "localhost"}`);
@@ -444,7 +457,7 @@ webWss.on("connection", (ws, req) => {
   webClients.add(client);
 
   if (client.authed) {
-    sendJson(ws, { type: "web.auth_ok", authRequired: false });
+    sendJson(ws, { type: "web.auth_ok", authRequired: false, bootId: RELAY_BOOT_ID });
     sendJson(ws, { type: "web.list", hosts: buildHostGroups() });
   }
 
@@ -475,7 +488,7 @@ webWss.on("connection", (ws, req) => {
         if (msg.token === WEB_TOKEN) {
           authFailures.delete(clientIp);
           client.authed = true;
-          sendJson(ws, { type: "web.auth_ok", authRequired: true });
+          sendJson(ws, { type: "web.auth_ok", authRequired: true, bootId: RELAY_BOOT_ID });
           sendJson(ws, { type: "web.list", hosts: buildHostGroups() });
         } else {
           const nextCount = (rec ? rec.count : 0) + 1;

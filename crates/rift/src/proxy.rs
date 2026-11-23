@@ -209,6 +209,10 @@ enum OutboundEvent {
 
 pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
     std::thread::spawn(cleanup_old_uploads);
+    // Start TLS + WebSocket handshake in parallel with PTY/shell startup to cut `+` spawn latency.
+    let ws_url = normalize_ws_url(&opts.config.relay, "/ws/agent");
+    let ws_url_prefetch = ws_url.clone();
+    let mut initial_connect = Some(tokio::spawn(async move { connect_async(&ws_url_prefetch).await }));
     let session_id = gen_session_id();
     let shell_bin = opts
         .command
@@ -346,16 +350,21 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
         }
 
         // 3. Local terminal resize poller (250ms)
+        // Track the physical local window size separately (`last_local`) so a remote
+        // Web `TermResize` is not immediately reverted 250ms later; only when the user
+        // actually resizes the local terminal window does local take back control.
         {
             let pty_master = Arc::clone(&pty_master);
             let current_size = Arc::clone(&current_size);
             let shutting_down = Arc::clone(&shutting_down);
             let out_tx = out_tx.clone();
             std::thread::spawn(move || {
+                let mut last_local = (init_cols, init_rows);
                 while !shutting_down.load(Ordering::Relaxed) {
                     std::thread::sleep(Duration::from_millis(250));
                     if let Ok((cols, rows)) = crossterm::terminal::size() {
-                        if cols >= 20 && rows >= 5 {
+                        if cols >= 20 && rows >= 5 && (cols != last_local.0 || rows != last_local.1) {
+                            last_local = (cols, rows);
                             let mut changed = false;
                             if let Ok(mut sz) = current_size.lock() {
                                 if sz.0 != cols || sz.1 != rows {
@@ -392,7 +401,6 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
     });
 
     // 5. Async WebSocket relay loop (never kills local shell on network error)
-    let ws_url = normalize_ws_url(&opts.config.relay, "/ws/agent");
     let cfg = opts.config.clone();
     let sid_for_ws = session_id.clone();
     let ring_for_ws = Arc::clone(&ring);
@@ -408,7 +416,15 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
             if shutting_for_ws.load(Ordering::Relaxed) {
                 break;
             }
-            match connect_async(&ws_url).await {
+            let conn_res = if let Some(handle) = initial_connect.take() {
+                match handle.await {
+                    Ok(res) => res,
+                    Err(_) => connect_async(&ws_url).await,
+                }
+            } else {
+                connect_async(&ws_url).await
+            };
+            match conn_res {
                 Ok((ws_stream, _)) => {
                     backoff = Duration::from_secs(1);
                     let (mut write, mut read) = ws_stream.split();
@@ -548,6 +564,7 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                                                 {
                                                     let _ = killer.kill();
                                                     shutting_for_ws.store(true, Ordering::Relaxed);
+                                                    let _ = write.send(Message::Close(None)).await;
                                                     break;
                                                 }
                                                 ControlMessage::TermPasteImage { session_id, mime, data }

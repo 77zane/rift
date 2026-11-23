@@ -83,6 +83,7 @@ export type ControlMessage =
   | {
       type: "web.auth_ok";
       authRequired: boolean;
+      bootId?: string;
     }
   | {
       type: "web.auth_err";

@@ -109,16 +109,12 @@ pub fn default_shell(configured: &str) -> String {
     }
     #[cfg(windows)]
     {
-        for cand in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
-            if std::process::Command::new("where.exe")
-                .arg(cand)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return cand.to_string();
+        if let Some(path_var) = std::env::var_os("PATH") {
+            let dirs: Vec<PathBuf> = std::env::split_paths(&path_var).collect();
+            for cand in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+                if dirs.iter().any(|d| d.join(cand).is_file()) {
+                    return cand.to_string();
+                }
             }
         }
         std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())

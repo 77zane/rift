@@ -1,6 +1,7 @@
 use crate::config::{normalize_ws_url, RiftConfig};
 use crate::protocol::ControlMessage;
 use futures_util::SinkExt;
+use std::io::{IsTerminal, Read};
 use std::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -41,7 +42,25 @@ pub async fn run_agent_hook(
     }
 
     let ws_url = normalize_ws_url(&cfg.relay, "/ws/agent");
-    let state = normalize_state(&event).to_string();
+    let mut state = normalize_state(&event).to_string();
+
+    // Inspect hook stdin JSON for agent-specific nuances:
+    // - agy `Stop`: `"fullyIdle": false` means background tasks are still running -> stay `"running"`.
+    // - claude `Notification`: `"notification_type": "idle_prompt"` is just an idle reminder -> `"idle"`.
+    if (state == "idle" || state == "waiting") && !std::io::stdin().is_terminal() {
+        let mut stdin_buf = String::new();
+        if std::io::stdin().read_to_string(&mut stdin_buf).is_ok() {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdin_buf) {
+                if state == "idle" && v.get("fullyIdle").and_then(|b| b.as_bool()) == Some(false) {
+                    state = "running".to_string();
+                } else if state == "waiting"
+                    && v.get("notification_type").and_then(|s| s.as_str()) == Some("idle_prompt")
+                {
+                    state = "idle".to_string();
+                }
+            }
+        }
+    }
     let msg = ControlMessage::AgentState {
         session_id,
         agent,
