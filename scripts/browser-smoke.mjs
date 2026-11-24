@@ -209,25 +209,49 @@ async function main() {
       "--disable-gpu",
       "--no-first-run",
       "--no-default-browser-check",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-sync",
+      "--disable-default-apps",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--remote-debugging-address=127.0.0.1",
       `--remote-debugging-port=${cdpPort}`,
       `--user-data-dir=${userDataDir}`,
       "--window-size=1280,800",
     ];
     if (process.platform === "linux") {
-      chromeArgs.push("--no-sandbox", "--disable-dev-shm-usage");
+      chromeArgs.push("--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage");
     }
     chromeArgs.push("about:blank");
 
     chrome = spawn(browserPath, chromeArgs, { stdio: ["ignore", "ignore", "pipe"] });
+    let chromeExit = null;
     chrome.stderr?.on("data", (d) => {
       if (chromeStderr.length < 4000) chromeStderr += d.toString();
     });
+    chrome.once("exit", (code, signal) => {
+      chromeExit = { code, signal };
+    });
 
-    const pageTarget = await waitUntil(async () => {
-      const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
-      const targets = await res.json();
-      return targets.find((t) => t.type === "page") ?? null;
-    }, `Chrome CDP target (stderr: ${chromeStderr.slice(0, 300)})`);
+    const pageTarget = await waitUntil(
+      async () => {
+        if (chromeExit) {
+          throw new Error(
+            `Chrome exited early (code=${chromeExit.code}, signal=${chromeExit.signal}) stderr=${chromeStderr.trim()}`
+          );
+        }
+        const res = await fetch(`http://127.0.0.1:${cdpPort}/json`);
+        const targets = await res.json();
+        return targets.find((t) => t.type === "page") ?? null;
+      },
+      "Chrome CDP target",
+      25_000
+    ).catch((err) => {
+      throw new Error(`${err.message} | chromeStderr=${chromeStderr.trim()}`);
+    });
 
     cdp = new WebSocket(pageTarget.webSocketDebuggerUrl);
     await new Promise((r, j) => {
