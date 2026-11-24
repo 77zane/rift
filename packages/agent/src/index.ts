@@ -157,6 +157,7 @@ const cwd = process.cwd();
 let currentCols = opts.cols ?? (process.stdout.isTTY ? process.stdout.columns : 120) ?? 120;
 let currentRows = opts.rows ?? (process.stdout.isTTY ? process.stdout.rows : 32) ?? 32;
 let currentTitle = opts.title || shellLabel;
+let hasCustomTitle = Boolean(opts.title);
 
 const ringBuffer = new ByteRingBuffer(256 * 1024);
 const textEncoder = new TextEncoder();
@@ -237,6 +238,8 @@ function connectRelay(): void {
       cwd,
       cols: currentCols,
       rows: currentRows,
+      headless: opts.noLocal,
+      customTitle: hasCustomTitle,
       secret: opts.secret || undefined,
     });
 
@@ -292,6 +295,15 @@ function connectRelay(): void {
       return;
     }
 
+    if (msg.type === "term.rename" && msg.sessionId === sessionId) {
+      const next = msg.title.trim().slice(0, 64);
+      if (next) {
+        currentTitle = next;
+        hasCustomTitle = true;
+      }
+      return;
+    }
+
     if (msg.type === "term.close" && msg.sessionId === sessionId) {
       cleanupAndExit(0);
     }
@@ -328,10 +340,12 @@ ptyProcess.onData((data) => {
   const bytes = textEncoder.encode(data);
   ringBuffer.push(bytes);
 
-  const nextTitle = extractOscTitle(data);
-  if (nextTitle && nextTitle !== currentTitle) {
-    currentTitle = nextTitle;
-    sendControl({ type: "agent.update", sessionId, title: currentTitle });
+  if (!hasCustomTitle) {
+    const nextTitle = extractOscTitle(data);
+    if (nextTitle && nextTitle !== currentTitle) {
+      currentTitle = nextTitle;
+      sendControl({ type: "agent.update", sessionId, title: currentTitle });
+    }
   }
 
   if (ws && ws.readyState === WebSocket.OPEN) {

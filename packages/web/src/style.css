@@ -319,6 +319,11 @@ body {
   box-shadow: var(--glow);
 }
 
+.session-item.reconnecting .session-dot {
+  background: var(--warn);
+  opacity: 0.75;
+}
+
 .session-sub {
   font-size: 10px;
   color: var(--subtle);
@@ -327,6 +332,10 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.session-sub.reconnecting {
+  color: var(--warn);
 }
 
 .session-sub.agent-status.state-running,

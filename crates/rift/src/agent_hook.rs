@@ -15,6 +15,23 @@ fn normalize_state(event: &str) -> &'static str {
     }
 }
 
+/// Refines reported hook state from optional agent stdin JSON:
+/// - agy `Stop`: `"fullyIdle": false` means background tasks are still running -> stay `"running"`.
+/// - claude `Notification`: `"notification_type": "idle_prompt"` is an idle reminder -> `"idle"`.
+fn refine_state_from_stdin(initial_state: &str, stdin_json: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(stdin_json) {
+        if initial_state == "idle" && v.get("fullyIdle").and_then(|b| b.as_bool()) == Some(false) {
+            return "running".to_string();
+        }
+        if initial_state == "waiting"
+            && v.get("notification_type").and_then(|s| s.as_str()) == Some("idle_prompt")
+        {
+            return "idle".to_string();
+        }
+    }
+    initial_state.to_string()
+}
+
 /// Fire-and-forget active state reporter invoked by AI CLI hooks (agy / claude / codex).
 /// Must ALWAYS return quickly (<600ms) and silently if not inside a Rift session.
 pub async fn run_agent_hook(
@@ -44,21 +61,10 @@ pub async fn run_agent_hook(
     let ws_url = normalize_ws_url(&cfg.relay, "/ws/agent");
     let mut state = normalize_state(&event).to_string();
 
-    // Inspect hook stdin JSON for agent-specific nuances:
-    // - agy `Stop`: `"fullyIdle": false` means background tasks are still running -> stay `"running"`.
-    // - claude `Notification`: `"notification_type": "idle_prompt"` is just an idle reminder -> `"idle"`.
     if (state == "idle" || state == "waiting") && !std::io::stdin().is_terminal() {
         let mut stdin_buf = String::new();
         if std::io::stdin().read_to_string(&mut stdin_buf).is_ok() {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&stdin_buf) {
-                if state == "idle" && v.get("fullyIdle").and_then(|b| b.as_bool()) == Some(false) {
-                    state = "running".to_string();
-                } else if state == "waiting"
-                    && v.get("notification_type").and_then(|s| s.as_str()) == Some("idle_prompt")
-                {
-                    state = "idle".to_string();
-                }
-            }
+            state = refine_state_from_stdin(&state, &stdin_buf);
         }
     }
     let msg = ControlMessage::AgentState {
@@ -83,4 +89,43 @@ pub async fn run_agent_hook(
     }
 
     emit_json();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_state_maps_known_events() {
+        assert_eq!(normalize_state("running"), "running");
+        assert_eq!(normalize_state("Pre_Tool_Use"), "tool");
+        assert_eq!(normalize_state("notification"), "waiting");
+        assert_eq!(normalize_state("Stop"), "idle");
+        assert_eq!(normalize_state("unknown"), "running");
+    }
+
+    #[test]
+    fn bugtdd_3_claude_idle_prompt_maps_to_idle_not_waiting() {
+        assert_eq!(
+            refine_state_from_stdin("waiting", r#"{"notification_type":"idle_prompt"}"#),
+            "idle"
+        );
+        assert_eq!(
+            refine_state_from_stdin("waiting", r#"{"notification_type":"permission_prompt"}"#),
+            "waiting"
+        );
+    }
+
+    #[test]
+    fn agy_stop_with_fully_idle_false_stays_running() {
+        assert_eq!(
+            refine_state_from_stdin("idle", r#"{"fullyIdle":false}"#),
+            "running"
+        );
+        assert_eq!(
+            refine_state_from_stdin("idle", r#"{"fullyIdle":true}"#),
+            "idle"
+        );
+        assert_eq!(refine_state_from_stdin("idle", "not-json"), "idle");
+    }
 }

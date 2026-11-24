@@ -19,6 +19,18 @@ pub struct SessionInfo {
     pub rows: u16,
     pub created_at: u64,
     pub last_active_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headless: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_title: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconnecting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_updated_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +66,8 @@ pub enum ControlMessage {
         rows: u16,
         #[serde(default)]
         headless: bool,
+        #[serde(default)]
+        custom_title: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         secret: Option<String>,
     },
@@ -85,13 +99,23 @@ pub enum ControlMessage {
         token: Option<String>,
     },
     #[serde(rename = "web.auth_ok", rename_all = "camelCase")]
-    WebAuthOk { auth_required: bool },
+    WebAuthOk {
+        auth_required: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        boot_id: Option<String>,
+    },
     #[serde(rename = "web.auth_err", rename_all = "camelCase")]
     WebAuthErr { message: String },
     #[serde(rename = "web.list", rename_all = "camelCase")]
     WebList { hosts: Vec<HostGroup> },
     #[serde(rename = "web.attach", rename_all = "camelCase")]
-    WebAttach { session_id: String },
+    WebAttach {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since_seq: Option<u64>,
+    },
+    #[serde(rename = "web.sync", rename_all = "camelCase")]
+    WebSync { session_id: String, seq: u64 },
     #[serde(rename = "web.detach", rename_all = "camelCase")]
     WebDetach { session_id: String },
     #[serde(rename = "term.resize", rename_all = "camelCase")]
@@ -110,6 +134,8 @@ pub enum ControlMessage {
     },
     #[serde(rename = "term.close", rename_all = "camelCase")]
     TermClose { session_id: String },
+    #[serde(rename = "term.rename", rename_all = "camelCase")]
+    TermRename { session_id: String, title: String },
     #[serde(rename = "term.paste_image", rename_all = "camelCase")]
     TermPasteImage {
         session_id: String,
@@ -179,5 +205,60 @@ impl ByteRingBuffer {
             out.extend_from_slice(c);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binary_frame_roundtrip_and_malformed_rejection() {
+        let payload = b"hello \x1b[32mworld\x1b[0m";
+        let frame = encode_binary_frame(FRAME_PTY_OUTPUT, "abc123", payload);
+        let (ftype, sid, body) = decode_binary_frame(&frame).expect("valid frame");
+        assert_eq!(ftype, FRAME_PTY_OUTPUT);
+        assert_eq!(sid, "abc123");
+        assert_eq!(body, payload);
+
+        assert!(decode_binary_frame(&[]).is_none());
+        assert!(decode_binary_frame(&[FRAME_PTY_INPUT]).is_none());
+        assert!(decode_binary_frame(&[FRAME_PTY_REPLAY, 10, b'a', b'b']).is_none());
+    }
+
+    #[test]
+    fn byte_ring_buffer_evicts_oldest_on_overflow() {
+        let mut rb = ByteRingBuffer::new(8);
+        rb.push(b"1234");
+        rb.push(b"5678");
+        assert_eq!(rb.snapshot(), b"12345678");
+        rb.push(b"90");
+        assert_eq!(rb.snapshot(), b"567890");
+    }
+
+    #[test]
+    fn control_message_wire_format_matches_ts_schema() {
+        let sync_json = r#"{"type":"web.sync","sessionId":"s1","seq":4096}"#;
+        let parsed: ControlMessage = serde_json::from_str(sync_json).expect("parse web.sync");
+        match parsed {
+            ControlMessage::WebSync { session_id, seq } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(seq, 4096);
+            }
+            _ => panic!("expected WebSync"),
+        }
+
+        let auth_json = r#"{"type":"web.auth_ok","authRequired":true,"bootId":"xyz123"}"#;
+        let parsed: ControlMessage = serde_json::from_str(auth_json).expect("parse web.auth_ok");
+        match parsed {
+            ControlMessage::WebAuthOk {
+                auth_required,
+                boot_id,
+            } => {
+                assert!(auth_required);
+                assert_eq!(boot_id.as_deref(), Some("xyz123"));
+            }
+            _ => panic!("expected WebAuthOk"),
+        }
     }
 }

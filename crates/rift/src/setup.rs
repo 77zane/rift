@@ -3,7 +3,9 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(windows)]
+use std::process::Stdio;
 
 const MARKER_START: &str = "# >>> rift auto-mirror hook >>>";
 const MARKER_END: &str = "# <<< rift auto-mirror hook <<<";
@@ -48,21 +50,45 @@ fn install_binary() -> Result<PathBuf> {
 
     if !same {
         // On Windows, running executables cannot be overwritten in-place, but can be renamed aside.
+        // Use a unique `.old.<ts>` fallback if a previous `rift.exe.old` is still locked by an open session.
+        #[cfg(windows)]
+        let mut renamed_backup: Option<PathBuf> = None;
         #[cfg(windows)]
         {
             stop_windows_daemon();
+            if let Some(parent) = target.parent() {
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name();
+                        if name.to_string_lossy().starts_with("rift.exe.old") {
+                            let _ = fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
             if target.exists() {
-                let backup = target.with_extension("exe.old");
-                let _ = fs::remove_file(&backup);
-                let _ = fs::rename(&target, &backup);
+                let primary_backup = target.with_extension("exe.old");
+                let backup = if !primary_backup.exists() {
+                    primary_backup
+                } else {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    target.with_extension(format!("exe.old.{ts}"))
+                };
+                if fs::rename(&target, &backup).is_ok() {
+                    renamed_backup = Some(backup);
+                }
             }
         }
         if let Err(e) = fs::copy(&current, &target) {
             #[cfg(windows)]
             {
-                let backup = target.with_extension("exe.old");
-                if !target.exists() && backup.exists() {
-                    let _ = fs::rename(&backup, &target);
+                if let Some(backup) = renamed_backup {
+                    if !target.exists() && backup.exists() {
+                        let _ = fs::rename(&backup, &target);
+                    }
                 }
             }
             eprintln!(
@@ -303,6 +329,38 @@ fn uninstall_shell_hooks() -> Result<Vec<String>> {
     Ok(removed)
 }
 
+fn merge_claude_hooks(root: &mut Value, exe_str: &str) {
+    if let Some(obj) = root.as_object_mut() {
+        let hooks_val = obj.entry("hooks").or_insert_with(|| json!({}));
+        if let Some(hooks_obj) = hooks_val.as_object_mut() {
+            for (hook_name, matcher, ev) in [
+                ("UserPromptSubmit", "*", "running"),
+                ("PreToolUse", "*", "tool"),
+                ("Notification", "permission_prompt|elicitation_dialog", "waiting"),
+                ("Stop", "*", "idle"),
+            ] {
+                let arr = hooks_obj
+                    .entry(hook_name)
+                    .or_insert_with(|| json!([]))
+                    .as_array_mut();
+                if let Some(list) = arr {
+                    // Remove any prior rift agent-hook entry before inserting fresh one
+                    list.retain(|item| !item.to_string().contains("agent-hook --agent claude"));
+                    list.push(json!({
+                        "matcher": matcher,
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": format!("\"{exe_str}\" agent-hook --agent claude --event {ev}")
+                            }
+                        ]
+                    }));
+                }
+            }
+        }
+    }
+}
+
 fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
     let home = dirs::home_dir().context("无法获取用户主目录")?;
     let exe_str = exe.to_string_lossy();
@@ -361,35 +419,7 @@ fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_else(|| json!({}));
 
-        if let Some(obj) = root.as_object_mut() {
-            let hooks_val = obj.entry("hooks").or_insert_with(|| json!({}));
-            if let Some(hooks_obj) = hooks_val.as_object_mut() {
-                for (hook_name, matcher, ev) in [
-                    ("UserPromptSubmit", "*", "running"),
-                    ("PreToolUse", "*", "tool"),
-                    ("Notification", "permission_prompt|elicitation_dialog", "waiting"),
-                    ("Stop", "*", "idle"),
-                ] {
-                    let arr = hooks_obj
-                        .entry(hook_name)
-                        .or_insert_with(|| json!([]))
-                        .as_array_mut();
-                    if let Some(list) = arr {
-                        // Remove any prior rift agent-hook entry before inserting fresh one
-                        list.retain(|item| !item.to_string().contains("agent-hook --agent claude"));
-                        list.push(json!({
-                            "matcher": matcher,
-                            "hooks": [
-                                {
-                                    "type": "command",
-                                    "command": format!("\"{exe_str}\" agent-hook --agent claude --event {ev}")
-                                }
-                            ]
-                        }));
-                    }
-                }
-            }
-        }
+        merge_claude_hooks(&mut root, &exe_str);
         fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
         installed.push(format!("Claude Code ({})", settings_path.display()));
     }
@@ -458,14 +488,22 @@ fn install_autostart_and_launch(exe: &Path) -> Result<String> {
         if let Some(parent) = vbs_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let exe_escaped = exe.to_string_lossy().replace('"', "\"\"");
-        let vbs_body = format!(
-            "Set sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"{exe_escaped}\"\" daemon\", 0, False\r\n"
-        );
+        let expected_exe = home.join(".rift").join("bin").join("rift.exe");
+        let vbs_body = if exe == expected_exe {
+            // Pure-ASCII VBS using %USERPROFILE% so Windows Script Host (ANSI/GBK) works
+            // reliably even on non-ASCII/Chinese Windows usernames.
+            "Set sh = CreateObject(\"WScript.Shell\")\r\nhomeDir = sh.ExpandEnvironmentStrings(\"%USERPROFILE%\")\r\nsh.CurrentDirectory = homeDir\r\nsh.Run \"\"\"\" & homeDir & \"\\.rift\\bin\\rift.exe\"\" daemon\", 0, False\r\n".to_string()
+        } else {
+            let exe_escaped = exe.to_string_lossy().replace('"', "\"\"");
+            let home_escaped = home.to_string_lossy().replace('"', "\"\"");
+            format!(
+                "Set sh = CreateObject(\"WScript.Shell\")\r\nsh.CurrentDirectory = \"{home_escaped}\"\r\nsh.Run \"\"\"{exe_escaped}\"\" daemon\", 0, False\r\n"
+            )
+        };
         fs::write(&vbs_path, vbs_body)?;
 
         let cmd_val = format!(
-            "wscript.exe //B //Nologo \"{}\"",
+            "C:\\Windows\\System32\\wscript.exe //B //Nologo \"{}\"",
             vbs_path.to_string_lossy()
         );
         let _ = Command::new("reg.exe")
@@ -487,17 +525,10 @@ fn install_autostart_and_launch(exe: &Path) -> Result<String> {
         // Replace any existing daemon instance so we never leave duplicates or stale binaries
         stop_windows_daemon();
 
-        // Launch daemon immediately in background (no console window)
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        let _ = Command::new(exe)
-            .arg("daemon")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
-            .spawn();
+        // Launch daemon immediately in background (no console window, detached from parent job)
+        let mut daemon_cmd = Command::new(exe);
+        daemon_cmd.arg("daemon").current_dir(&home);
+        let _ = crate::daemon::spawn_detached_command(&mut daemon_cmd);
 
         Ok("Windows 用户级静默开机自启 (wscript + start-daemon.vbs，无黑框) + 已立即后台启动".to_string())
     }
@@ -654,4 +685,39 @@ pub fn run_uninstall(purge: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bugtdd_3_claude_notification_hook_never_uses_wildcard_matcher() {
+        let mut settings = json!({
+            "hooks": {
+                "Notification": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "echo user-custom" }] },
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "\"old-rift\" agent-hook --agent claude --event waiting" }] }
+                ]
+            }
+        });
+
+        merge_claude_hooks(&mut settings, "/usr/local/bin/rift");
+
+        let notif = settings["hooks"]["Notification"].as_array().expect("Notification array");
+        // User's custom hook preserved, stale rift hook replaced by fresh one
+        assert_eq!(notif.len(), 2);
+        let rift_entry = notif
+            .iter()
+            .find(|item| item.to_string().contains("agent-hook --agent claude"))
+            .expect("rift notification hook");
+        assert_eq!(
+            rift_entry["matcher"].as_str(),
+            Some("permission_prompt|elicitation_dialog")
+        );
+
+        // Idempotent when invoked a second time
+        merge_claude_hooks(&mut settings, "/usr/local/bin/rift");
+        assert_eq!(settings["hooks"]["Notification"].as_array().unwrap().len(), 2);
+    }
 }

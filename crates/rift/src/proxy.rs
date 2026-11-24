@@ -1,4 +1,7 @@
 use crate::config::{default_shell, normalize_ws_url, platform_tag, RiftConfig};
+use crate::console::RawConsoleGuard;
+#[cfg(windows)]
+use crate::console::{normalize_win_conpty_input, WinOutputKeyboardFilter};
 use crate::daemon::spawn_detached_session;
 use crate::protocol::{
     decode_binary_frame, encode_binary_frame, ByteRingBuffer, ControlMessage, FRAME_PTY_INPUT,
@@ -12,9 +15,15 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, CloseFrame},
+        Message,
+    },
+};
 
 pub struct ProxyRunOptions {
     pub config: RiftConfig,
@@ -23,25 +32,6 @@ pub struct ProxyRunOptions {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub command: Vec<String>,
-}
-
-struct RawModeGuard(bool);
-
-impl RawModeGuard {
-    fn enter(enable: bool) -> Self {
-        if enable {
-            let _ = crossterm::terminal::enable_raw_mode();
-        }
-        Self(enable)
-    }
-}
-
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
 }
 
 fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -183,8 +173,12 @@ fn extract_osc_title(chunk: &str) -> Option<String> {
                             && title.as_bytes()[1] == b':'
                             && title.to_ascii_lowercase().ends_with(".exe")
                         {
-                            if let Some(name) = Path::new(&title).file_name() {
-                                title = name.to_string_lossy().to_string();
+                            if let Some(name) = title
+                                .rsplit(['\\', '/'])
+                                .next()
+                                .filter(|s| !s.is_empty())
+                            {
+                                title = name.to_string();
                             }
                         }
                         if !is_generic_shell_title(&title) {
@@ -212,7 +206,9 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
     // Start TLS + WebSocket handshake in parallel with PTY/shell startup to cut `+` spawn latency.
     let ws_url = normalize_ws_url(&opts.config.relay, "/ws/agent");
     let ws_url_prefetch = ws_url.clone();
-    let mut initial_connect = Some(tokio::spawn(async move { connect_async(&ws_url_prefetch).await }));
+    let mut initial_connect = Some(tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url_prefetch)).await
+    }));
     let session_id = gen_session_id();
     let shell_bin = opts
         .command
@@ -278,6 +274,7 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
 
     let ring = Arc::new(Mutex::new(ByteRingBuffer::new(2 * 1024 * 1024)));
     let default_title = default_dir_title(&cwd);
+    let custom_title = Arc::new(AtomicBool::new(opts.title.is_some()));
     let current_title = Arc::new(Mutex::new(
         opts.title.clone().unwrap_or_else(|| default_title.clone()),
     ));
@@ -286,40 +283,56 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
 
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<OutboundEvent>();
 
-    let _raw_guard = RawModeGuard::enter(local_tty);
+    let _raw_guard = RawConsoleGuard::enter(local_tty);
 
     // 1. PTY output -> local stdout + RingBuffer + Relay channel
     {
         let ring = Arc::clone(&ring);
         let current_title = Arc::clone(&current_title);
+        let custom_title = Arc::clone(&custom_title);
         let out_tx = out_tx.clone();
         let no_local = opts.no_local;
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut stdout = std::io::stdout();
+            #[cfg(windows)]
+            let mut win_out_filter = WinOutputKeyboardFilter::new();
             while let Ok(n) = pty_reader.read(&mut buf) {
                 if n == 0 {
                     break;
                 }
                 let slice = &buf[..n];
                 if !no_local {
-                    let _ = stdout.write_all(slice);
-                    let _ = stdout.flush();
+                    #[cfg(windows)]
+                    {
+                        let filtered = win_out_filter.filter(slice);
+                        if !filtered.is_empty() {
+                            let _ = stdout.write_all(&filtered);
+                            let _ = stdout.flush();
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let _ = stdout.write_all(slice);
+                        let _ = stdout.flush();
+                    }
                 }
                 if let Ok(mut rb) = ring.lock() {
                     rb.push(slice);
                 }
-                let text = String::from_utf8_lossy(slice);
-                if let Some(new_title) = extract_osc_title(&text) {
-                    let mut changed = false;
-                    if let Ok(mut t) = current_title.lock() {
-                        if *t != new_title {
-                            *t = new_title.clone();
-                            changed = true;
+                if !custom_title.load(Ordering::Relaxed) {
+                    let text = String::from_utf8_lossy(slice);
+                    if let Some(new_title) = extract_osc_title(&text) {
+                        let mut changed = false;
+                        if let Ok(mut t) = current_title.lock() {
+                            if *t != new_title {
+                                *t = new_title.clone();
+                                changed = true;
+                            }
                         }
-                    }
-                    if changed {
-                        let _ = out_tx.send(OutboundEvent::Title(new_title));
+                        if changed {
+                            let _ = out_tx.send(OutboundEvent::Title(new_title));
+                        }
                     }
                 }
                 let _ = out_tx.send(OutboundEvent::Output(slice.to_vec()));
@@ -339,9 +352,17 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                     match stdin.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
-                            if let Ok(mut w) = pty_writer.lock() {
-                                let _ = w.write_all(&buf[..n]);
-                                let _ = w.flush();
+                            #[cfg(windows)]
+                            let normalized = normalize_win_conpty_input(&buf[..n]);
+                            #[cfg(windows)]
+                            let to_write = normalized.as_slice();
+                            #[cfg(not(windows))]
+                            let to_write = &buf[..n];
+                            if !to_write.is_empty() {
+                                if let Ok(mut w) = pty_writer.lock() {
+                                    let _ = w.write_all(to_write);
+                                    let _ = w.flush();
+                                }
                             }
                         }
                     }
@@ -405,10 +426,12 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
     let sid_for_ws = session_id.clone();
     let ring_for_ws = Arc::clone(&ring);
     let title_for_ws = Arc::clone(&current_title);
+    let custom_title_for_ws = Arc::clone(&custom_title);
     let size_for_ws = Arc::clone(&current_size);
     let writer_for_ws = Arc::clone(&pty_writer);
     let master_for_ws = Arc::clone(&pty_master);
     let shutting_for_ws = Arc::clone(&shutting_down);
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
 
     let ws_task = tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
@@ -419,13 +442,15 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
             let conn_res = if let Some(handle) = initial_connect.take() {
                 match handle.await {
                     Ok(res) => res,
-                    Err(_) => connect_async(&ws_url).await,
+                    Err(_) => {
+                        tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url)).await
+                    }
                 }
             } else {
-                connect_async(&ws_url).await
+                tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url)).await
             };
             match conn_res {
-                Ok((ws_stream, _)) => {
+                Ok(Ok((ws_stream, _))) => {
                     backoff = Duration::from_secs(1);
                     let (mut write, mut read) = ws_stream.split();
                     let (cols, rows) = size_for_ws.lock().map(|s| *s).unwrap_or((init_cols, init_rows));
@@ -442,6 +467,7 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                         cols,
                         rows,
                         headless: opts.no_local,
+                        custom_title: custom_title_for_ws.load(Ordering::Relaxed),
                         secret: if cfg.secret.is_empty() {
                             None
                         } else {
@@ -455,6 +481,9 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                         }
                     }
 
+                    // Drain queued pre-reconnect events before snapshot (ring already holds all of them)
+                    while out_rx.try_recv().is_ok() {}
+
                     // Upload Ring Buffer snapshot so relay restores screen even after relay restart
                     let snap = ring_for_ws.lock().map(|rb| rb.snapshot()).unwrap_or_default();
                     if !snap.is_empty() {
@@ -462,16 +491,40 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                         let _ = write.send(Message::Binary(frame.into())).await;
                     }
 
+                    let mut last_rx = Instant::now();
+                    let mut awaiting_pong = false;
+                    let mut missed_pongs: u32 = 0;
                     let mut hb = tokio::time::interval(Duration::from_secs(15));
+                    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    hb.tick().await; // consume immediate first tick
                     loop {
                         tokio::select! {
+                            _ = &mut close_rx => {
+                                let _ = write.send(Message::Close(Some(CloseFrame {
+                                    code: CloseCode::Normal,
+                                    reason: "shell_exit".into(),
+                                }))).await;
+                                let _ = write.flush().await;
+                                return;
+                            }
                             _ = hb.tick() => {
+                                if awaiting_pong {
+                                    missed_pongs += 1;
+                                }
+                                if missed_pongs >= 2 || last_rx.elapsed() > Duration::from_secs(45) {
+                                    // Half-open TCP connection after sleep/wake or Wi-Fi roam -> reconnect now
+                                    break;
+                                }
                                 let msg = ControlMessage::AgentHeartbeat { session_id: sid_for_ws.clone() };
                                 if let Ok(txt) = serde_json::to_string(&msg) {
                                     if write.send(Message::Text(txt.into())).await.is_err() {
                                         break;
                                     }
                                 }
+                                if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                    break;
+                                }
+                                awaiting_pong = true;
                             }
                             ev = out_rx.recv() => {
                                 match ev {
@@ -482,15 +535,17 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                                         }
                                     }
                                     Some(OutboundEvent::Title(t)) => {
-                                        let msg = ControlMessage::AgentUpdate {
-                                            session_id: sid_for_ws.clone(),
-                                            title: Some(t),
-                                            cwd: None,
-                                            cols: None,
-                                            rows: None,
-                                        };
-                                        if let Ok(txt) = serde_json::to_string(&msg) {
-                                            let _ = write.send(Message::Text(txt.into())).await;
+                                        if !custom_title_for_ws.load(Ordering::Relaxed) {
+                                            let msg = ControlMessage::AgentUpdate {
+                                                session_id: sid_for_ws.clone(),
+                                                title: Some(t),
+                                                cwd: None,
+                                                cols: None,
+                                                rows: None,
+                                            };
+                                            if let Ok(txt) = serde_json::to_string(&msg) {
+                                                let _ = write.send(Message::Text(txt.into())).await;
+                                            }
                                         }
                                     }
                                     Some(OutboundEvent::Size(c, r)) => {
@@ -511,41 +566,61 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                             incoming = read.next() => {
                                 match incoming {
                                     Some(Ok(Message::Binary(bin))) => {
+                                        last_rx = Instant::now();
+                                        awaiting_pong = false;
+                                        missed_pongs = 0;
                                         if let Some((ftype, sid, payload)) = decode_binary_frame(&bin) {
                                             if ftype == FRAME_PTY_INPUT && sid == sid_for_ws {
-                                                if let Ok(mut w) = writer_for_ws.lock() {
-                                                    let _ = w.write_all(payload);
-                                                    let _ = w.flush();
+                                                #[cfg(windows)]
+                                                let normalized = normalize_win_conpty_input(payload);
+                                                #[cfg(windows)]
+                                                let to_write = normalized.as_slice();
+                                                #[cfg(not(windows))]
+                                                let to_write = payload;
+                                                if !to_write.is_empty() {
+                                                    if let Ok(mut w) = writer_for_ws.lock() {
+                                                        let _ = w.write_all(to_write);
+                                                        let _ = w.flush();
+                                                    }
                                                 }
                                             }
                                         }
                                     }
                                     Some(Ok(Message::Text(txt))) => {
+                                        last_rx = Instant::now();
+                                        awaiting_pong = false;
+                                        missed_pongs = 0;
                                         if let Ok(ctrl) = serde_json::from_str::<ControlMessage>(&txt) {
                                             match ctrl {
                                                 ControlMessage::TermResize { session_id, cols, rows }
                                                     if session_id == sid_for_ws =>
                                                 {
+                                                    let mut changed = false;
                                                     if let Ok(mut sz) = size_for_ws.lock() {
-                                                        *sz = (cols, rows);
+                                                        if sz.0 != cols || sz.1 != rows {
+                                                            *sz = (cols, rows);
+                                                            changed = true;
+                                                        }
                                                     }
-                                                    if let Ok(m) = master_for_ws.lock() {
-                                                        let _ = m.resize(PtySize {
-                                                            rows,
-                                                            cols,
-                                                            pixel_width: 0,
-                                                            pixel_height: 0,
-                                                        });
-                                                    }
-                                                    let upd = ControlMessage::AgentUpdate {
-                                                        session_id: sid_for_ws.clone(),
-                                                        title: None,
-                                                        cwd: None,
-                                                        cols: Some(cols),
-                                                        rows: Some(rows),
-                                                    };
-                                                    if let Ok(s) = serde_json::to_string(&upd) {
-                                                        let _ = write.send(Message::Text(s.into())).await;
+                                                    if changed {
+                                                        if let Ok(m) = master_for_ws.lock() {
+                                                            let _ = m.resize(PtySize {
+                                                                rows,
+                                                                cols,
+                                                                pixel_width: 0,
+                                                                pixel_height: 0,
+                                                            });
+                                                        }
+                                                        let upd = ControlMessage::AgentUpdate {
+                                                            session_id: sid_for_ws.clone(),
+                                                            title: None,
+                                                            cwd: None,
+                                                            cols: Some(cols),
+                                                            rows: Some(rows),
+                                                        };
+                                                        if let Ok(s) = serde_json::to_string(&upd) {
+                                                            let _ = write.send(Message::Text(s.into())).await;
+                                                        }
                                                     }
                                                 }
                                                 ControlMessage::HostSpawn { host_id, shell, cwd: req_cwd }
@@ -559,12 +634,27 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                                                         req_cwd,
                                                     );
                                                 }
+                                                ControlMessage::TermRename { session_id, title }
+                                                    if session_id == sid_for_ws =>
+                                                {
+                                                    let next: String = title.trim().chars().take(64).collect();
+                                                    if !next.is_empty() {
+                                                        if let Ok(mut t) = title_for_ws.lock() {
+                                                            *t = next;
+                                                        }
+                                                        custom_title_for_ws.store(true, Ordering::Relaxed);
+                                                    }
+                                                }
                                                 ControlMessage::TermClose { session_id }
                                                     if session_id == sid_for_ws =>
                                                 {
                                                     let _ = killer.kill();
                                                     shutting_for_ws.store(true, Ordering::Relaxed);
-                                                    let _ = write.send(Message::Close(None)).await;
+                                                    let _ = write.send(Message::Close(Some(CloseFrame {
+                                                        code: CloseCode::Normal,
+                                                        reason: "term_close".into(),
+                                                    }))).await;
+                                                    let _ = write.flush().await;
                                                     break;
                                                 }
                                                 ControlMessage::TermPasteImage { session_id, mime, data }
@@ -587,16 +677,30 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
                                         }
                                     }
                                     Some(Ok(Message::Ping(p))) => {
-                                        let _ = write.send(Message::Pong(p)).await;
+                                        last_rx = Instant::now();
+                                        awaiting_pong = false;
+                                        missed_pongs = 0;
+                                        if write.send(Message::Pong(p)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Some(Ok(Message::Pong(_))) => {
+                                        last_rx = Instant::now();
+                                        awaiting_pong = false;
+                                        missed_pongs = 0;
                                     }
                                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
-                                    _ => {}
+                                    Some(Ok(_)) => {
+                                        last_rx = Instant::now();
+                                        awaiting_pong = false;
+                                        missed_pongs = 0;
+                                    }
                                 }
                             }
                         }
                     }
                 }
-                Err(_) => {
+                Ok(Err(_)) | Err(_) => {
                     // Drain queued output while offline so memory stays bounded
                     while out_rx.try_recv().is_ok() {}
                 }
@@ -605,13 +709,59 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
             if shutting_for_ws.load(Ordering::Relaxed) {
                 break;
             }
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = &mut close_rx => break,
+                _ = tokio::time::sleep(backoff) => {}
+            }
             backoff = (backoff * 2).min(Duration::from_secs(5));
         }
     });
 
     let exit_code = exit_rx.await.unwrap_or(0);
     shutting_down.store(true, Ordering::Relaxed);
-    ws_task.abort();
+    let _ = close_tx.send(());
+    let mut ws_task = ws_task;
+    if tokio::time::timeout(Duration::from_millis(300), &mut ws_task)
+        .await
+        .is_err()
+    {
+        ws_task.abort();
+    }
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_base64_handles_standard_whitespace_and_rejects_invalid() {
+        assert_eq!(decode_base64("SGVsbG8sIFJpZnQh").as_deref(), Some(b"Hello, Rift!".as_slice()));
+        assert_eq!(decode_base64("SGVs\r\nbG8=").as_deref(), Some(b"Hello".as_slice()));
+        assert_eq!(decode_base64("not@valid!"), None);
+    }
+
+    #[test]
+    fn extract_osc_title_filters_generic_shells_and_keeps_real_titles() {
+        // Generic shell names & full Windows system32 exe paths must be ignored
+        assert_eq!(extract_osc_title("\x1b]0;pwsh.exe\x07"), None);
+        assert_eq!(
+            extract_osc_title("\x1b]0;C:\\Windows\\System32\\cmd.exe\x07"),
+            None
+        );
+        // Real project/app title using BEL or ST terminator must be captured
+        assert_eq!(
+            extract_osc_title("\x1b]0;agy — agentshare\x07"),
+            Some("agy — agentshare".to_string())
+        );
+        assert_eq!(
+            extract_osc_title("\x1b]2;build-server\x1b\\"),
+            Some("build-server".to_string())
+        );
+    }
+
+    #[test]
+    fn default_dir_title_uses_leaf_directory_name() {
+        assert_eq!(default_dir_title("/tmp/my-project"), "my-project");
+    }
 }

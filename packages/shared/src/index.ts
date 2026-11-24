@@ -23,6 +23,7 @@ export interface SessionInfo {
   lastActiveAt: number;
   headless?: boolean;
   customTitle?: boolean;
+  reconnecting?: boolean;
   agentName?: string;
   agentState?: AgentState;
   agentUpdatedAt?: number;
@@ -55,6 +56,7 @@ export type ControlMessage =
       cols: number;
       rows: number;
       headless?: boolean;
+      customTitle?: boolean;
       secret?: string;
     }
   | {

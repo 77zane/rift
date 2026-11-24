@@ -134,3 +134,28 @@ pub fn platform_tag() -> &'static str {
         "linux"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_ws_url_handles_http_https_and_existing_suffix() {
+        assert_eq!(
+            normalize_ws_url("https://term.example.com/", "/ws/agent"),
+            "wss://term.example.com/ws/agent"
+        );
+        assert_eq!(
+            normalize_ws_url("http://127.0.0.1:7700", "/ws/web"),
+            "ws://127.0.0.1:7700/ws/web"
+        );
+        assert_eq!(
+            normalize_ws_url("wss://term.example.com/ws/agent", "/ws/agent"),
+            "wss://term.example.com/ws/agent"
+        );
+        assert_eq!(
+            normalize_ws_url("ws://localhost:7700/", "/ws/agent"),
+            "ws://localhost:7700/ws/agent"
+        );
+    }
+}

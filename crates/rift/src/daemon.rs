@@ -6,6 +6,51 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+pub(crate) fn spawn_detached_command(cmd: &mut Command) -> std::io::Result<std::process::Child> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+
+        // Try breaking away from any parent Job Object (e.g. when daemon or setup was
+        // launched from a CLI runner / IDE / agent) so parent exit never kills spawned sessions.
+        cmd.creation_flags(
+            CREATE_NO_WINDOW
+                | DETACHED_PROCESS
+                | CREATE_NEW_PROCESS_GROUP
+                | CREATE_BREAKAWAY_FROM_JOB,
+        );
+        match cmd.spawn() {
+            Ok(child) => Ok(child),
+            Err(_) => {
+                cmd.creation_flags(
+                    CREATE_NO_WINDOW | DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                );
+                cmd.spawn()
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        cmd.spawn()
+    }
+
+    #[cfg(not(any(windows, unix)))]
+    {
+        cmd.spawn()
+    }
+}
+
 pub fn spawn_detached_session(
     relay: &str,
     host: &str,
@@ -28,22 +73,11 @@ pub fn spawn_detached_session(
         cmd.arg("--secret").arg(secret);
     }
     cmd.arg("--").arg(target_shell);
-    if let Some(dir) = cwd {
+    if let Some(dir) = cwd.or_else(|| dirs::home_dir().map(|p| p.to_string_lossy().to_string())) {
         cmd.current_dir(dir);
     }
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
-    }
-
-    let _ = cmd.spawn();
+    let _ = spawn_detached_command(&mut cmd);
 }
 
 pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
@@ -77,6 +111,8 @@ pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
                 }
 
                 let mut last_rx = Instant::now();
+                let mut awaiting_pong = false;
+                let mut missed_pongs: u32 = 0;
                 let mut ping_tick = tokio::time::interval(Duration::from_secs(20));
                 ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 ping_tick.tick().await; // consume immediate first tick
@@ -84,18 +120,24 @@ pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
                 loop {
                     tokio::select! {
                         _ = ping_tick.tick() => {
-                            if last_rx.elapsed() > Duration::from_secs(60) {
+                            if awaiting_pong {
+                                missed_pongs += 1;
+                            }
+                            if missed_pongs >= 2 || last_rx.elapsed() > Duration::from_secs(60) {
                                 // Half-open TCP connection (e.g. after sleep/wake or network switch)
                                 break;
                             }
                             if write.send(Message::Ping(Vec::new().into())).await.is_err() {
                                 break;
                             }
+                            awaiting_pong = true;
                         }
                         incoming = read.next() => {
                             match incoming {
                                 Some(Ok(Message::Text(txt))) => {
                                     last_rx = Instant::now();
+                                    awaiting_pong = false;
+                                    missed_pongs = 0;
                                     if let Ok(ControlMessage::HostSpawn {
                                         host_id,
                                         shell,
@@ -115,16 +157,22 @@ pub async fn run_daemon(cfg: RiftConfig) -> Result<()> {
                                 }
                                 Some(Ok(Message::Ping(p))) => {
                                     last_rx = Instant::now();
+                                    awaiting_pong = false;
+                                    missed_pongs = 0;
                                     if write.send(Message::Pong(p)).await.is_err() {
                                         break;
                                     }
                                 }
                                 Some(Ok(Message::Pong(_))) => {
                                     last_rx = Instant::now();
+                                    awaiting_pong = false;
+                                    missed_pongs = 0;
                                 }
                                 Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
                                 Some(Ok(_)) => {
                                     last_rx = Instant::now();
+                                    awaiting_pong = false;
+                                    missed_pongs = 0;
                                 }
                             }
                         }

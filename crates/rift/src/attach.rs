@@ -1,4 +1,7 @@
 use crate::config::{normalize_ws_url, RiftConfig};
+use crate::console::RawConsoleGuard;
+#[cfg(windows)]
+use crate::console::{normalize_win_conpty_input, WinOutputKeyboardFilter};
 use crate::protocol::{
     decode_binary_frame, encode_binary_frame, ControlMessage, SessionInfo, FRAME_PTY_INPUT,
     FRAME_PTY_OUTPUT, FRAME_PTY_REPLAY,
@@ -11,15 +14,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-
-struct RawModeGuard(bool);
-impl Drop for RawModeGuard {
-    fn drop(&mut self) {
-        if self.0 {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
-    }
-}
 
 fn prompt_line(prompt: &str) -> Result<String> {
     print!("{prompt}");
@@ -128,16 +122,14 @@ pub async fn run_attach(cfg: RiftConfig, target: Option<String>) -> Result<()> {
 
     let attach_msg = ControlMessage::WebAttach {
         session_id: sid.clone(),
+        since_seq: None,
     };
     write
         .send(Message::Text(serde_json::to_string(&attach_msg)?.into()))
         .await?;
 
     let local_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if local_tty {
-        let _ = crossterm::terminal::enable_raw_mode();
-    }
-    let _raw_guard = RawModeGuard(local_tty);
+    let _raw_guard = RawConsoleGuard::enter(local_tty);
 
     let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let detached = Arc::new(AtomicBool::new(false));
@@ -150,12 +142,19 @@ pub async fn run_attach(cfg: RiftConfig, target: Option<String>) -> Result<()> {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if buf[..n].contains(&0x1d) {
+                        #[cfg(windows)]
+                        let bytes = normalize_win_conpty_input(&buf[..n]);
+                        #[cfg(not(windows))]
+                        let bytes = buf[..n].to_vec();
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        if bytes.contains(&0x1d) {
                             detached.store(true, Ordering::Relaxed);
                             let _ = in_tx.send(Vec::new());
                             break;
                         }
-                        if in_tx.send(buf[..n].to_vec()).is_err() {
+                        if in_tx.send(bytes).is_err() {
                             break;
                         }
                     }
@@ -165,6 +164,8 @@ pub async fn run_attach(cfg: RiftConfig, target: Option<String>) -> Result<()> {
     }
 
     let mut stdout = std::io::stdout();
+    #[cfg(windows)]
+    let mut win_out_filter = WinOutputKeyboardFilter::new();
     loop {
         tokio::select! {
             chunk = in_rx.recv() => {
@@ -189,8 +190,19 @@ pub async fn run_attach(cfg: RiftConfig, target: Option<String>) -> Result<()> {
                     Some(Ok(Message::Binary(bin))) => {
                         if let Some((ftype, frame_sid, payload)) = decode_binary_frame(&bin) {
                             if frame_sid == sid && (ftype == FRAME_PTY_OUTPUT || ftype == FRAME_PTY_REPLAY) {
-                                let _ = stdout.write_all(payload);
-                                let _ = stdout.flush();
+                                #[cfg(windows)]
+                                {
+                                    let filtered = win_out_filter.filter(payload);
+                                    if !filtered.is_empty() {
+                                        let _ = stdout.write_all(&filtered);
+                                        let _ = stdout.flush();
+                                    }
+                                }
+                                #[cfg(not(windows))]
+                                {
+                                    let _ = stdout.write_all(payload);
+                                    let _ = stdout.flush();
+                                }
                             }
                         }
                     }

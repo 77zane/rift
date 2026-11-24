@@ -21,6 +21,9 @@ const PORT = Number(process.env.PORT ?? 7700);
 const HOST = process.env.HOST ?? "0.0.0.0";
 const AGENT_SECRET = process.env.AGENT_SECRET ?? "";
 const WEB_TOKEN = process.env.WEB_TOKEN ?? "";
+const SESSION_GRACE_MS = Math.max(0, Number(process.env.SESSION_GRACE_MS ?? 15_000));
+const REMEMBERED_TITLE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MAX_MISSED_PINGS = 2;
 const WEB_DIST = process.env.WEB_DIST
   ? path.resolve(process.env.WEB_DIST)
   : path.resolve(__dirname, "../../web/dist");
@@ -41,14 +44,18 @@ interface AgentSession {
   info: SessionInfo;
   buffer: ByteRingBuffer;
   viewers: Set<WebClient>;
-  alive: boolean;
+  missedPings: number;
+  closing: boolean;
+  disconnected: boolean;
+  needsViewerResync: boolean;
+  graceTimer: NodeJS.Timeout | null;
 }
 
 interface WebClient {
   ws: WebSocket;
   authed: boolean;
   attachedSessionId: string | null;
-  alive: boolean;
+  missedPings: number;
 }
 
 interface HostDaemon {
@@ -56,12 +63,13 @@ interface HostDaemon {
   hostId: string;
   hostName: string;
   platform: string;
-  alive: boolean;
+  missedPings: number;
 }
 
 const sessions = new Map<string, AgentSession>();
 const hostDaemons = new Map<string, HostDaemon>();
 const webClients = new Set<WebClient>();
+const rememberedTitles = new Map<string, { title: string; updatedAt: number }>();
 const RELAY_BOOT_ID = Math.random().toString(36).slice(2, 10);
 
 // Lightweight in-memory brute-force protection for WEB_TOKEN auth (5 fails -> 15 min lock per IP)
@@ -140,6 +148,26 @@ function detachViewer(client: WebClient): void {
     prev.viewers.delete(client);
   }
   client.attachedSessionId = null;
+}
+
+function finalizeSessionClose(sessionId: string, clearRememberedTitle: boolean): void {
+  const sess = sessions.get(sessionId);
+  if (!sess) return;
+  if (sess.graceTimer) {
+    clearTimeout(sess.graceTimer);
+    sess.graceTimer = null;
+  }
+  sessions.delete(sessionId);
+  if (clearRememberedTitle) {
+    rememberedTitles.delete(sessionId);
+  }
+  for (const viewer of sess.viewers) {
+    if (viewer.attachedSessionId === sessionId) {
+      viewer.attachedSessionId = null;
+    }
+  }
+  sess.viewers.clear();
+  broadcastSessionList();
 }
 
 function applyAgentState(sessionId: string, agent: string, state: "running" | "tool" | "waiting" | "idle"): boolean {
@@ -269,21 +297,24 @@ server.on("upgrade", (req, socket, head) => {
 agentWss.on("connection", (ws) => {
   let boundSessionId: string | null = null;
   let boundDaemonHostId: string | null = null;
-  let alive = true;
 
-  ws.on("pong", () => {
-    alive = true;
+  const markAlive = () => {
     if (boundSessionId) {
       const s = sessions.get(boundSessionId);
-      if (s) s.alive = true;
+      if (s && s.ws === ws) s.missedPings = 0;
     }
     if (boundDaemonHostId) {
       const d = hostDaemons.get(boundDaemonHostId);
-      if (d) d.alive = true;
+      if (d && d.ws === ws) d.missedPings = 0;
     }
-  });
+  };
+
+  ws.on("pong", markAlive);
+  ws.on("ping", markAlive);
 
   ws.on("message", (raw, isBinary) => {
+    markAlive();
+
     if (isBinary) {
       const frame = decodeBinaryFrame(toUint8Array(raw));
       if (!frame || !boundSessionId || frame.sessionId !== boundSessionId) return;
@@ -293,10 +324,23 @@ agentWss.on("connection", (ws) => {
       sess.info.lastActiveAt = Date.now();
       if (frame.frameType === FRAME_PTY_REPLAY) {
         sess.buffer.replace(frame.payload);
-        // Forward replay only if viewers are waiting; usually initial reconnect restore.
+        if (sess.needsViewerResync) {
+          sess.needsViewerResync = false;
+          const snap = sess.buffer.snapshot();
+          const headSeq = sess.buffer.headOffset;
+          for (const viewer of sess.viewers) {
+            if (viewer.ws.readyState === WebSocket.OPEN) {
+              if (snap.length > 0) {
+                viewer.ws.send(encodeBinaryFrame(FRAME_PTY_REPLAY, boundSessionId, snap));
+              }
+              sendJson(viewer.ws, { type: "web.sync", sessionId: boundSessionId, seq: headSeq });
+            }
+          }
+        }
         return;
       }
       if (frame.frameType === FRAME_PTY_OUTPUT) {
+        sess.needsViewerResync = false;
         sess.buffer.push(frame.payload);
         const out = encodeBinaryFrame(FRAME_PTY_OUTPUT, boundSessionId, frame.payload);
         for (const viewer of sess.viewers) {
@@ -331,7 +375,7 @@ agentWss.on("connection", (ws) => {
         hostId: msg.hostId,
         hostName: msg.hostName,
         platform: msg.platform,
-        alive,
+        missedPings: 0,
       });
       broadcastSessionList();
       return;
@@ -345,6 +389,10 @@ agentWss.on("connection", (ws) => {
       }
 
       const existing = sessions.get(msg.sessionId);
+      if (existing?.graceTimer) {
+        clearTimeout(existing.graceTimer);
+        existing.graceTimer = null;
+      }
       const viewers = existing ? existing.viewers : new Set<WebClient>();
       const buffer = existing ? existing.buffer : new ByteRingBuffer(4 * 1024 * 1024);
       if (existing && existing.ws !== ws) {
@@ -352,6 +400,22 @@ agentWss.on("connection", (ws) => {
       }
 
       const now = Date.now();
+      const remembered = rememberedTitles.get(msg.sessionId);
+      let title = msg.title;
+      let customTitle = false;
+      if (existing?.info.customTitle) {
+        title = existing.info.title;
+        customTitle = true;
+      } else if (msg.customTitle && msg.title.trim()) {
+        title = msg.title.trim().slice(0, 64);
+        customTitle = true;
+        rememberedTitles.set(msg.sessionId, { title, updatedAt: now });
+      } else if (remembered) {
+        title = remembered.title;
+        customTitle = true;
+        remembered.updatedAt = now;
+      }
+
       boundSessionId = msg.sessionId;
       sessions.set(msg.sessionId, {
         ws,
@@ -360,20 +424,33 @@ agentWss.on("connection", (ws) => {
           hostId: msg.hostId,
           hostName: msg.hostName,
           platform: msg.platform,
-          title: existing?.info.customTitle ? existing.info.title : msg.title,
+          title,
           shell: msg.shell,
           cwd: msg.cwd,
           cols: msg.cols,
           rows: msg.rows,
           headless: Boolean(msg.headless),
-          customTitle: existing?.info.customTitle ?? false,
+          customTitle,
+          reconnecting: false,
+          agentName: existing?.info.agentName,
+          agentState: existing?.info.agentState,
+          agentUpdatedAt: existing?.info.agentUpdatedAt,
           createdAt: existing ? existing.info.createdAt : now,
           lastActiveAt: now,
         },
         buffer,
         viewers,
-        alive,
+        missedPings: 0,
+        closing: false,
+        disconnected: false,
+        needsViewerResync: Boolean(existing && viewers.size > 0),
+        graceTimer: null,
       });
+
+      // Push authoritative custom title down to agent if agent did not already have it
+      if (customTitle && !msg.customTitle) {
+        sendJson(ws, { type: "term.rename", sessionId: msg.sessionId, title });
+      }
 
       broadcastSessionList();
       return;
@@ -417,11 +494,11 @@ agentWss.on("connection", (ws) => {
 
     if (msg.type === "agent.heartbeat" && boundSessionId) {
       const sess = sessions.get(boundSessionId);
-      if (sess) sess.alive = true;
+      if (sess && sess.ws === ws) sess.missedPings = 0;
     }
   });
 
-  ws.on("close", () => {
+  ws.on("close", (code) => {
     let changed = false;
     if (boundDaemonHostId) {
       const d = hostDaemons.get(boundDaemonHostId);
@@ -431,15 +508,28 @@ agentWss.on("connection", (ws) => {
       }
     }
     if (boundSessionId) {
-      const sess = sessions.get(boundSessionId);
+      const sid = boundSessionId;
+      const sess = sessions.get(sid);
       if (sess && sess.ws === ws) {
-        sessions.delete(boundSessionId);
-        for (const viewer of sess.viewers) {
-          if (viewer.attachedSessionId === boundSessionId) {
-            viewer.attachedSessionId = null;
-          }
+        const cleanClose = sess.closing || code === 1000;
+        if (cleanClose || SESSION_GRACE_MS <= 0) {
+          finalizeSessionClose(sid, true);
+          changed = false; // finalizeSessionClose already broadcasts
+        } else {
+          // Unexpected disconnect (Wi-Fi roam, sleep/wake, network blip): keep session alive
+          // during grace period so viewers aren't kicked out and custom titles aren't wiped.
+          sess.disconnected = true;
+          sess.info.reconnecting = true;
+          if (sess.graceTimer) clearTimeout(sess.graceTimer);
+          sess.graceTimer = setTimeout(() => {
+            const cur = sessions.get(sid);
+            if (cur && cur.ws === ws && cur.disconnected) {
+              finalizeSessionClose(sid, false);
+            }
+          }, SESSION_GRACE_MS);
+          sess.graceTimer.unref();
+          changed = true;
         }
-        changed = true;
       }
     }
     if (changed) broadcastSessionList();
@@ -452,7 +542,7 @@ webWss.on("connection", (ws, req) => {
     ws,
     authed: !WEB_TOKEN,
     attachedSessionId: null,
-    alive: true,
+    missedPings: 0,
   };
   webClients.add(client);
 
@@ -462,10 +552,14 @@ webWss.on("connection", (ws, req) => {
   }
 
   ws.on("pong", () => {
-    client.alive = true;
+    client.missedPings = 0;
+  });
+  ws.on("ping", () => {
+    client.missedPings = 0;
   });
 
   ws.on("message", (raw, isBinary) => {
+    client.missedPings = 0;
     if (!client.authed) {
       if (isBinary) return;
       let msg: ControlMessage;
@@ -586,7 +680,12 @@ webWss.on("connection", (ws, req) => {
     if (msg.type === "term.close") {
       const sess = sessions.get(msg.sessionId);
       if (!sess) return;
-      sendJson(sess.ws, msg);
+      sess.closing = true;
+      if (sess.disconnected || sess.ws.readyState !== WebSocket.OPEN) {
+        finalizeSessionClose(msg.sessionId, true);
+      } else {
+        sendJson(sess.ws, msg);
+      }
       return;
     }
 
@@ -597,6 +696,11 @@ webWss.on("connection", (ws, req) => {
       if (!next) return;
       sess.info.title = next;
       sess.info.customTitle = true;
+      rememberedTitles.set(msg.sessionId, { title: next, updatedAt: Date.now() });
+      // Sync custom title to agent so it survives network drops AND relay restarts
+      if (sess.ws.readyState === WebSocket.OPEN) {
+        sendJson(sess.ws, { type: "term.rename", sessionId: msg.sessionId, title: next });
+      }
       broadcastSessionList();
       return;
     }
@@ -615,40 +719,57 @@ webWss.on("connection", (ws, req) => {
   });
 });
 
-// Heartbeat sweep every 25s
+// Heartbeat sweep every 25s (allow MAX_MISSED_PINGS=2 -> 50s tolerance before terminating)
 const heartbeatTimer = setInterval(() => {
+  let daemonChanged = false;
   for (const [id, daemon] of hostDaemons) {
-    if (!daemon.alive) {
-      daemon.ws.terminate();
+    if (daemon.ws.readyState === WebSocket.CLOSED) {
       hostDaemons.delete(id);
+      daemonChanged = true;
       continue;
     }
-    daemon.alive = false;
+    if (daemon.missedPings >= MAX_MISSED_PINGS) {
+      daemon.ws.terminate();
+      continue;
+    }
+    daemon.missedPings += 1;
     if (daemon.ws.readyState === WebSocket.OPEN) {
       daemon.ws.ping();
     }
   }
-  for (const [id, sess] of sessions) {
-    if (!sess.alive) {
+  if (daemonChanged) broadcastSessionList();
+
+  for (const [, sess] of sessions) {
+    if (sess.disconnected) continue;
+    if (sess.missedPings >= MAX_MISSED_PINGS) {
+      // Let the close handler apply the grace period & viewer cleanup uniformly
       sess.ws.terminate();
-      sessions.delete(id);
       continue;
     }
-    sess.alive = false;
+    sess.missedPings += 1;
     if (sess.ws.readyState === WebSocket.OPEN) {
       sess.ws.ping();
     }
   }
+
   for (const client of webClients) {
-    if (!client.alive) {
+    if (client.missedPings >= MAX_MISSED_PINGS) {
       client.ws.terminate();
       detachViewer(client);
       webClients.delete(client);
       continue;
     }
-    client.alive = false;
+    client.missedPings += 1;
     if (client.ws.readyState === WebSocket.OPEN) {
       client.ws.ping();
+    }
+  }
+
+  // Prune stale remembered custom titles
+  const now = Date.now();
+  for (const [sid, rec] of rememberedTitles) {
+    if (!sessions.has(sid) && now - rec.updatedAt > REMEMBERED_TITLE_TTL_MS) {
+      rememberedTitles.delete(sid);
     }
   }
 }, 25_000);

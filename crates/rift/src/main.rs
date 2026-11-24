@@ -1,6 +1,7 @@
 mod agent_hook;
 mod attach;
 mod config;
+mod console;
 mod daemon;
 mod hook;
 mod protocol;

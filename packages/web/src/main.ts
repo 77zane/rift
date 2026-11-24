@@ -4,6 +4,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
 import {
   FRAME_PTY_INPUT,
   FRAME_PTY_OUTPUT,
@@ -14,6 +15,12 @@ import {
   type HostGroup,
   type SessionInfo,
 } from "@rift/shared";
+import {
+  resolveSizeMode,
+  sanitizePastedText,
+  shouldResetSessionCursors,
+  type SizeMode,
+} from "./terminal-utils";
 
 const isMobileViewport = () => window.innerWidth < 768;
 
@@ -49,6 +56,9 @@ let activeSessionId: string | null = null;
 let initialHashSessionId: string | null = location.hash
   ? decodeURIComponent(location.hash.slice(1))
   : null;
+// Remembers the last session the user explicitly opened so transient offline/relay restarts
+// automatically return to it when it comes back online (without hijacking manual switches).
+let preferredSessionId: string | null = initialHashSessionId;
 let pendingSpawnHostId: string | null = null;
 let pendingSpawnKnownIds = new Set<string>();
 const prevAgentStates = new Map<string, string>();
@@ -76,7 +86,7 @@ const XTERM_THEMES = {
     foreground: "#eae7df",
     cursor: "#cc785c",
     selectionBackground: "rgba(204, 120, 92, 0.32)",
-    black: "#1a1917",
+    black: "#2a2825",
     red: "#ec6f74",
     green: "#9aca86",
     yellow: "#e8c96b",
@@ -84,13 +94,21 @@ const XTERM_THEMES = {
     magenta: "#c297ff",
     cyan: "#6dd3ce",
     white: "#eae7df",
+    brightBlack: "#7c776f",
+    brightRed: "#ff8c90",
+    brightGreen: "#b3e09f",
+    brightYellow: "#f5dc8b",
+    brightBlue: "#84c0fa",
+    brightMagenta: "#d5b5ff",
+    brightCyan: "#8ee6e1",
+    brightWhite: "#faf8f3",
   },
   phosphor: {
     background: "#070a08",
     foreground: "#d7f5e1",
     cursor: "#39d98a",
     selectionBackground: "rgba(57, 217, 138, 0.28)",
-    black: "#0b100d",
+    black: "#1b2b22",
     red: "#ff6b72",
     green: "#39d98a",
     yellow: "#e8c96b",
@@ -98,6 +116,14 @@ const XTERM_THEMES = {
     magenta: "#c594ff",
     cyan: "#4be3c4",
     white: "#d7f5e1",
+    brightBlack: "#5f8c73",
+    brightRed: "#ff8f95",
+    brightGreen: "#66ebaa",
+    brightYellow: "#f5dc8b",
+    brightBlue: "#85d3ff",
+    brightMagenta: "#d9b5ff",
+    brightCyan: "#7bf0d8",
+    brightWhite: "#f0fff5",
   },
 };
 
@@ -107,30 +133,48 @@ interface SessionTerminal {
   pane: HTMLDivElement;
   decoder: TextDecoder;
   lastSeq: number | null;
+  lastSentSize: { cols: number; rows: number } | null;
   webglAddon: WebglAddon | null;
 }
 
 const sessionTerms = new Map<string, SessionTerminal>();
 
-function getOrCreateSessionTerm(sessionId: string): SessionTerminal {
+function getOrCreateSessionTerm(sessionId: string, sess?: SessionInfo | null): SessionTerminal {
   const existing = sessionTerms.get(sessionId);
-  if (existing) return existing;
+  if (existing) {
+    if (sess?.platform === "win32" && !existing.term.options.windowsPty) {
+      existing.term.options.windowsPty = { backend: "conpty", buildNumber: 19045 };
+    }
+    return existing;
+  }
 
   const pane = document.createElement("div");
   pane.className = "session-term-pane hidden";
   termContainerEl.appendChild(pane);
 
   const term = new Terminal({
+    allowProposedApi: true,
     cursorBlink: true,
     fontSize: isMobileViewport() ? 12 : 15,
     lineHeight: isMobileViewport() ? 1.25 : 1.2,
     fontFamily: '"JetBrains Mono", "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace',
     scrollback: 10000,
+    rescaleOverlappingGlyphs: true,
+    minimumContrastRatio: 2.5,
     theme: XTERM_THEMES[themeName],
+    windowsPty:
+      sess?.platform === "win32" ? { backend: "conpty", buildNumber: 19045 } : undefined,
   });
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+  try {
+    const unicode11 = new Unicode11Addon();
+    term.loadAddon(unicode11);
+    term.unicode.activeVersion = "11";
+  } catch {
+    // Fallback to default Unicode table if unsupported
+  }
   // Ctrl+Click (Windows/Linux) or Cmd+Click (macOS) opens links in a new tab; plain tap works on mobile.
   term.loadAddon(
     new WebLinksAddon((ev: MouseEvent, uri: string) => {
@@ -189,6 +233,7 @@ function getOrCreateSessionTerm(sessionId: string): SessionTerminal {
     pane,
     decoder: new TextDecoder(),
     lastSeq: null,
+    lastSentSize: sess ? { cols: sess.cols, rows: sess.rows } : null,
     webglAddon: null,
   };
   sessionTerms.set(sessionId, entry);
@@ -246,6 +291,8 @@ function applyTheme(): void {
   btnTheme.textContent = themeName === "ember" ? "EMBER" : "PHOSPHOR";
   for (const entry of sessionTerms.values()) {
     entry.term.options.theme = XTERM_THEMES[themeName];
+    entry.webglAddon?.clearTextureAtlas();
+    entry.term.refresh(0, entry.term.rows - 1);
   }
   localStorage.setItem("rift_theme", themeName);
 }
@@ -359,18 +406,10 @@ window.addEventListener(
     ev.preventDefault();
     ev.stopImmediatePropagation();
 
-    // Never auto-submit on trailing CR/LF
-    const trimmedEnd = raw.replace(/[\r\n]+$/, "");
-    if (!trimmedEnd) return;
-
-    if (activeTerm.modes.bracketedPasteMode) {
-      const normalized = trimmedEnd.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-      sendTerminalInput(`\x1b[200~${normalized}\x1b[201~`);
-    } else {
-      // Without bracketed paste, any CR/LF acts as Enter and submits immediately.
-      const singleLine = trimmedEnd.replace(/[\r\n]+/g, " ");
-      sendTerminalInput(singleLine);
-    }
+    // Never auto-submit on trailing CR/LF (paste or voice-IME dictation)
+    const sanitized = sanitizePastedText(raw, activeTerm.modes.bracketedPasteMode);
+    if (!sanitized) return;
+    sendTerminalInput(sanitized);
     activeTerm.focus();
   },
   { capture: true }
@@ -403,14 +442,8 @@ function findSession(id: string | null): SessionInfo | null {
   return null;
 }
 
-function resolveSizeModeFor(sess: SessionInfo | null): "follow-host" | "fit-local" {
-  if (!sess) return "follow-host";
-  const manual = sizeModeOverrides.get(sess.sessionId);
-  if (manual) return manual;
-  // Remote-spawned headless sessions have no local physical window -> fill browser screen!
-  if (sess.headless && !isMobileViewport()) return "fit-local";
-  if (sess.headless && isMobileViewport()) return "fit-local";
-  return "follow-host";
+function resolveSizeModeFor(sess: SessionInfo | null): SizeMode {
+  return resolveSizeMode(sess, sizeModeOverrides);
 }
 
 function updateSizeModeUI(): void {
@@ -435,17 +468,30 @@ function applyTerminalSize(): void {
   if (sizeMode === "follow-host") {
     if (term.cols !== sess.cols || term.rows !== sess.rows) {
       term.resize(sess.cols, sess.rows);
+      entry.lastSentSize = { cols: sess.cols, rows: sess.rows };
+      entry.webglAddon?.clearTextureAtlas();
     }
   } else {
     try {
+      const prevCols = term.cols;
+      const prevRows = term.rows;
       fitAddon.fit();
+      if (term.cols !== prevCols || term.rows !== prevRows) {
+        entry.webglAddon?.clearTextureAtlas();
+      }
       if (term.cols >= 20 && term.rows >= 5) {
-        sendControl({
-          type: "term.resize",
-          sessionId: sess.sessionId,
-          cols: term.cols,
-          rows: term.rows,
-        });
+        const alreadySynced =
+          (sess.cols === term.cols && sess.rows === term.rows) ||
+          (entry.lastSentSize?.cols === term.cols && entry.lastSentSize?.rows === term.rows);
+        if (!alreadySynced) {
+          entry.lastSentSize = { cols: term.cols, rows: term.rows };
+          sendControl({
+            type: "term.resize",
+            sessionId: sess.sessionId,
+            cols: term.cols,
+            rows: term.rows,
+          });
+        }
       }
     } catch {
       // container hidden or not ready
@@ -458,7 +504,10 @@ function closeMobileSidebar(): void {
   backdropEl.classList.add("hidden");
 }
 
-function attachSession(sessionId: string): void {
+function attachSession(sessionId: string, opts: { explicit?: boolean } = {}): void {
+  if (opts.explicit || preferredSessionId === null) {
+    preferredSessionId = sessionId;
+  }
   if (activeSessionId === sessionId) {
     closeMobileSidebar();
     return;
@@ -475,20 +524,22 @@ function attachSession(sessionId: string): void {
   initialHashSessionId = null;
   history.replaceState(null, "", `#${encodeURIComponent(sessionId)}`);
 
-  const entry = getOrCreateSessionTerm(sessionId);
+  const sess = findSession(sessionId);
+  const entry = getOrCreateSessionTerm(sessionId, sess);
   emptyStateEl.classList.add("hidden");
   termContainerEl.classList.remove("hidden");
   entry.pane.classList.remove("hidden");
-  enableWebglFor(entry);
-  entry.term.refresh(0, entry.term.rows - 1);
 
-  const sess = findSession(sessionId);
   if (sess) {
     lastHostSizes.set(sess.sessionId, { cols: sess.cols, rows: sess.rows });
+    entry.lastSentSize = { cols: sess.cols, rows: sess.rows };
     sizeMode = resolveSizeModeFor(sess);
     activeTitleEl.textContent = `${sess.hostName} :: ${sess.title}`;
     updateSizeModeUI();
   }
+  enableWebglFor(entry);
+  entry.webglAddon?.clearTextureAtlas();
+  entry.term.refresh(0, entry.term.rows - 1);
   updateDocumentTitle();
   sendControl({
     type: "web.attach",
@@ -569,8 +620,11 @@ function renderHostList(): void {
       const displayTitle = seen > 1 && !s.customTitle ? `${baseTitle} #${seen}` : baseTitle;
 
       const itemEl = document.createElement("div");
-      itemEl.className = "session-item" + (s.sessionId === activeSessionId ? " active" : "");
-      itemEl.onclick = () => attachSession(s.sessionId);
+      itemEl.className =
+        "session-item" +
+        (s.sessionId === activeSessionId ? " active" : "") +
+        (s.reconnecting ? " reconnecting" : "");
+      itemEl.onclick = () => attachSession(s.sessionId, { explicit: true });
       itemEl.ondblclick = (e) => {
         e.stopPropagation();
         startRenameSession(s);
@@ -589,7 +643,10 @@ function renderHostList(): void {
 
       const subEl = document.createElement("div");
       const agentText = formatAgentText(s);
-      if (agentText && s.agentState) {
+      if (s.reconnecting) {
+        subEl.className = "session-sub reconnecting";
+        subEl.textContent = "重连中…";
+      } else if (agentText && s.agentState) {
         subEl.className = `session-sub agent-status state-${s.agentState}`;
         subEl.textContent = agentText;
       } else {
@@ -618,6 +675,9 @@ function renderHostList(): void {
       closeBtn.onclick = (e) => {
         e.stopPropagation();
         if (confirm(`确定关闭 ${host.hostName} 上的「${displayTitle}」吗？`)) {
+          if (preferredSessionId === s.sessionId) {
+            preferredSessionId = null;
+          }
           sendControl({ type: "term.close", sessionId: s.sessionId });
         }
       };
@@ -634,7 +694,7 @@ function renderHostList(): void {
 
   const current = findSession(activeSessionId);
   if (current) {
-    const agentBadge = formatAgentText(current);
+    const agentBadge = current.reconnecting ? "重连中" : formatAgentText(current);
     activeTitleEl.textContent = agentBadge
       ? `${current.hostName} :: ${current.title} [${agentBadge}]`
       : `${current.hostName} :: ${current.title}`;
@@ -669,10 +729,13 @@ function renderHostList(): void {
     activeSessionId = null;
     if (total > 0) {
       const allSessions = hosts.flatMap((h) => h.sessions);
+      const preferredTarget = preferredSessionId
+        ? allSessions.find((s) => s.sessionId === preferredSessionId)
+        : undefined;
       const hashTarget = initialHashSessionId
         ? allSessions.find((s) => s.sessionId === initialHashSessionId)
         : undefined;
-      const target = hashTarget ?? allSessions[0];
+      const target = preferredTarget ?? hashTarget ?? allSessions[0];
       if (target) attachSession(target.sessionId);
     } else {
       activeTitleEl.textContent = "NO ACTIVE SESSION";
@@ -717,7 +780,10 @@ function connect(): void {
       if (frame.frameType === FRAME_PTY_REPLAY) {
         entry.decoder = new TextDecoder();
         entry.term.reset();
-        entry.term.write(entry.decoder.decode(frame.payload, { stream: true }));
+        entry.term.write(entry.decoder.decode(frame.payload, { stream: true }), () => {
+          entry.webglAddon?.clearTextureAtlas();
+          entry.term.refresh(0, entry.term.rows - 1);
+        });
       } else if (frame.frameType === FRAME_PTY_OUTPUT) {
         entry.term.write(entry.decoder.decode(frame.payload, { stream: true }));
         if (entry.lastSeq !== null) {
@@ -746,7 +812,7 @@ function connect(): void {
       authModalEl.classList.add("hidden");
       authErrorEl.textContent = "";
       if (msg.bootId) {
-        if (relayBootId && relayBootId !== msg.bootId) {
+        if (shouldResetSessionCursors(relayBootId, msg.bootId)) {
           // Relay restarted: invalidate cached byte offsets so reattach triggers a clean full replay
           for (const entry of sessionTerms.values()) {
             entry.lastSeq = null;
@@ -806,7 +872,14 @@ function connect(): void {
       renderHostList();
       if (spawnedSessionId) {
         needsReattach = false;
-        attachSession(spawnedSessionId);
+        attachSession(spawnedSessionId, { explicit: true });
+      } else if (
+        preferredSessionId &&
+        preferredSessionId !== activeSessionId &&
+        findSession(preferredSessionId)
+      ) {
+        needsReattach = false;
+        attachSession(preferredSessionId);
       } else if (needsReattach && prevActive && findSession(prevActive)) {
         needsReattach = false;
         const entry = sessionTerms.get(prevActive);
@@ -899,6 +972,14 @@ if (btnPickImage && imageFileInput) {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     updateDocumentTitle();
+    const activeEntry = getActiveSessionTerm();
+    if (activeEntry) {
+      activeEntry.webglAddon?.clearTextureAtlas();
+      activeEntry.term.refresh(0, activeEntry.term.rows - 1);
+    }
+    if (!ws || ws.readyState === WebSocket.CLOSED) {
+      connect();
+    }
   }
 });
 
@@ -920,10 +1001,18 @@ authFormEl.onsubmit = (e) => {
   sendControl({ type: "web.auth", token: authToken });
 };
 
+let windowResizeTimer: number | null = null;
 window.addEventListener("resize", () => {
-  if (sizeMode === "fit-local") {
-    applyTerminalSize();
+  if (sizeMode !== "fit-local") return;
+  if (windowResizeTimer !== null) {
+    clearTimeout(windowResizeTimer);
   }
+  windowResizeTimer = window.setTimeout(() => {
+    windowResizeTimer = null;
+    if (sizeMode === "fit-local") {
+      applyTerminalSize();
+    }
+  }, 80);
 });
 
 // If relay requires auth, show modal when no auth_ok arrives shortly after open
