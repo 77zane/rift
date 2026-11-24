@@ -1,7 +1,7 @@
 use crate::config::{normalize_ws_url, RiftConfig};
 use crate::console::RawConsoleGuard;
 #[cfg(windows)]
-use crate::console::{normalize_win_conpty_input, WinOutputKeyboardFilter};
+use crate::console::{WinConptyInputNormalizer, WinOutputKeyboardFilter};
 use crate::protocol::{
     decode_binary_frame, encode_binary_frame, ControlMessage, SessionInfo, FRAME_PTY_INPUT,
     FRAME_PTY_OUTPUT, FRAME_PTY_REPLAY,
@@ -138,12 +138,14 @@ pub async fn run_attach(cfg: RiftConfig, target: Option<String>) -> Result<()> {
         std::thread::spawn(move || {
             let mut stdin = std::io::stdin();
             let mut buf = [0u8; 512];
+            #[cfg(windows)]
+            let mut win_in_norm = WinConptyInputNormalizer::new();
             while !detached.load(Ordering::Relaxed) {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         #[cfg(windows)]
-                        let bytes = normalize_win_conpty_input(&buf[..n]);
+                        let bytes = win_in_norm.process(&buf[..n]);
                         #[cfg(not(windows))]
                         let bytes = buf[..n].to_vec();
                         if bytes.is_empty() {

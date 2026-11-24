@@ -63,6 +63,8 @@ const cases = [
   ["HOME", "\x1b[H", "1b5b48"],
   ["END", "\x1b[F", "1b5b46"],
   ["SHIFT_TAB", "\x1b[Z", "1b5b5a"],
+  ["ALT_V", "\x1bv", "1b76"],
+  ["CTRL_V", "\x16", "16"],
   ["UTF8_ZH", "中文", "e4b8ade69687"],
   ["CTRL_D", "\x04", "04"],
 ];

@@ -8,7 +8,7 @@
 
 1. **零重型业务编排**：不做任务数据库、Git Worktree 管理、AI 对话解析或权限拦截；终端里跑什么（`agy`/`claude`/`codex`/`pwsh`/`bash`），一律按原生 PTY 透明透传。
 2. **本地 100% 原生无感**：不套复用器边框或劫持常用快捷键。
-   - **Windows ConPTY 键位契约**：本地 `stdin` 必须启用 `ENABLE_VIRTUAL_TERMINAL_INPUT`（`crates/rift/src/console.rs`），退出时通过 RAII 精确恢复原 ConsoleMode；同时在 Windows 本地输出侧剥离 inbox `conhost.exe` 不支持的键盘协议升级请求（Kitty CSI-u、`modifyOtherKeys`、`win32-input-mode`），并在进入 ConPTY 的输入侧兜底翻译这三类序列，确保 `Esc`、`Ctrl+C`、方向键、`Home`/`End`、`Shift+Tab`、`Shift+Enter` 和中文 UTF-8 零丢失。
+   - **Windows ConPTY 键位契约**：本地 `stdin` 必须启用 `ENABLE_VIRTUAL_TERMINAL_INPUT`（`crates/rift/src/console.rs`），退出时通过 RAII 精确恢复原 ConsoleMode；同时在 Windows 本地输出侧剥离 inbox `conhost.exe` 不支持的键盘协议升级请求（Kitty CSI-u、`modifyOtherKeys`、`win32-input-mode`），并在进入 ConPTY 的输入侧兜底翻译这三类序列，以及将 Windows Terminal 贴图时发出的空括号粘贴（`\x1b[200~\x1b[201~`）转为 `Alt+V`（`\x1bv`），防止 inbox `conhost.exe` 吞掉括号粘贴导致 `Ctrl+V` 贴图失效，确保 `Esc`、`Ctrl+C`、`Ctrl+V`（文字与图片）、方向键、`Home`/`End`、`Shift+Tab`、`Shift+Enter` 和中文 UTF-8 零丢失。
 3. **单文件零依赖客户端**：`crates/rift` 编译为跨平台单文件二进制（~1.5–1.8 MB），不依赖目标机 Node.js，不引入重型运行时依赖。
 
 ---

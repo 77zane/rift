@@ -296,9 +296,12 @@ fn rewrite_win_keyboard_mode_seq(prefix: u8, params: &[u8], final_byte: u8) -> S
     }
 }
 
-/// Defense-in-depth input normalizer for Windows inbox ConPTY.
+/// Defense-in-depth streaming input normalizer for Windows inbox ConPTY.
 ///
-/// Translates enhanced keyboard sequences that Windows inbox `conhost.exe` silently drops:
+/// Translates sequences that Windows inbox `conhost.exe` silently drops:
+/// - Empty bracketed paste (`ESC [ 200 ~ ESC [ 201 ~`), which Windows Terminal emits on
+///   `Ctrl+V` when the clipboard contains an image -> `ESC v` (`Alt+V`), triggering native
+///   clipboard image paste in `agy` and `Claude Code` without losing the signal to ConPTY.
 /// - Kitty CSI-u: `ESC [ <codepoint>(:<shifted>)? (;<modifiers>(:<event>)?)? u`
 /// - XTerm modifyOtherKeys: `ESC [ 27 ; <modifiers> ; <codepoint> ~`
 /// - Win32 input mode: `ESC [ <vk> ; <sc> ; <uc> ; <kd> ; <cs> ; <rc> _`
@@ -306,60 +309,114 @@ fn rewrite_win_keyboard_mode_seq(prefix: u8, params: &[u8], final_byte: u8) -> S
 /// Lone `0x1b` (`Esc`), standard VT sequences (`\x1b[A`, `\x1b[H`, `\x1b[Z`), C0 control
 /// bytes (`\x03`), and UTF-8 text pass through untouched with zero buffering delay.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn normalize_win_conpty_input(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len());
-    let mut i = 0;
+#[derive(Default)]
+pub struct WinConptyInputNormalizer {
+    pending_bp_open: bool,
+}
 
-    while i < input.len() {
-        if input[i] != 0x1b || i + 1 >= input.len() || input[i + 1] != b'[' {
-            out.push(input[i]);
-            i += 1;
-            continue;
+#[cfg_attr(not(windows), allow(dead_code))]
+impl WinConptyInputNormalizer {
+    pub fn new() -> Self {
+        Self {
+            pending_bp_open: false,
         }
-
-        let start = i + 2;
-        let mut j = start;
-        while j < input.len()
-            && (j - start) < 40
-            && (input[j].is_ascii_digit() || input[j] == b';' || input[j] == b':')
-        {
-            j += 1;
-        }
-
-        if j < input.len() && j > start {
-            let params = std::str::from_utf8(&input[start..j]).unwrap_or("");
-            let final_byte = input[j];
-            match final_byte {
-                b'u' => {
-                    if let Some(mapped) = translate_kitty_csi_u(params) {
-                        out.extend_from_slice(&mapped);
-                        i = j + 1;
-                        continue;
-                    }
-                }
-                b'~' => {
-                    if let Some(mapped) = translate_modify_other_keys(params) {
-                        out.extend_from_slice(&mapped);
-                        i = j + 1;
-                        continue;
-                    }
-                }
-                b'_' => {
-                    if let Some(mapped) = translate_win32_input_mode(params) {
-                        out.extend_from_slice(&mapped);
-                        i = j + 1;
-                        continue;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        out.push(input[i]);
-        i += 1;
     }
 
-    out
+    pub fn process(&mut self, input: &[u8]) -> Vec<u8> {
+        const BP_OPEN: &[u8] = b"\x1b[200~";
+        const BP_CLOSE: &[u8] = b"\x1b[201~";
+
+        let mut combined;
+        let data: &[u8] = if self.pending_bp_open {
+            self.pending_bp_open = false;
+            combined = Vec::with_capacity(BP_OPEN.len() + input.len());
+            combined.extend_from_slice(BP_OPEN);
+            combined.extend_from_slice(input);
+            &combined
+        } else {
+            input
+        };
+
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+
+        while i < data.len() {
+            // Handle Windows Terminal empty bracketed paste (`ESC[200~ESC[201~`) for clipboard images.
+            if data[i..].starts_with(BP_OPEN) {
+                let after_open = i + BP_OPEN.len();
+                if after_open == data.len() {
+                    // Defer only the 6-byte open marker in case `ESC[201~` arrives in the next read.
+                    self.pending_bp_open = true;
+                    break;
+                }
+                if data[after_open..].starts_with(BP_CLOSE) {
+                    // Empty bracketed paste -> Alt+V (`ESC v`), accepted by inbox ConPTY & agy/claude.
+                    out.extend_from_slice(b"\x1bv");
+                    i = after_open + BP_CLOSE.len();
+                    continue;
+                }
+                // Non-empty bracketed paste: pass open marker through normally.
+                out.extend_from_slice(BP_OPEN);
+                i = after_open;
+                continue;
+            }
+
+            if data[i] != 0x1b || i + 1 >= data.len() || data[i + 1] != b'[' {
+                out.push(data[i]);
+                i += 1;
+                continue;
+            }
+
+            let start = i + 2;
+            let mut j = start;
+            while j < data.len()
+                && (j - start) < 40
+                && (data[j].is_ascii_digit() || data[j] == b';' || data[j] == b':')
+            {
+                j += 1;
+            }
+
+            if j < data.len() && j > start {
+                let params = std::str::from_utf8(&data[start..j]).unwrap_or("");
+                let final_byte = data[j];
+                match final_byte {
+                    b'u' => {
+                        if let Some(mapped) = translate_kitty_csi_u(params) {
+                            out.extend_from_slice(&mapped);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    b'~' => {
+                        if let Some(mapped) = translate_modify_other_keys(params) {
+                            out.extend_from_slice(&mapped);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    b'_' => {
+                        if let Some(mapped) = translate_win32_input_mode(params) {
+                            out.extend_from_slice(&mapped);
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            out.push(data[i]);
+            i += 1;
+        }
+
+        out
+    }
+}
+
+/// Stateless convenience wrapper around `WinConptyInputNormalizer::process`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn normalize_win_conpty_input(input: &[u8]) -> Vec<u8> {
+    WinConptyInputNormalizer::new().process(input)
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -676,5 +733,26 @@ mod tests {
         assert_eq!(normalize_win_conpty_input(b"\x1b[13;28;13;1;16;1_"), b"\x1b\r");
         // AltGr (RIGHT_ALT 0x01 + LEFT_CTRL 0x08 = 9) typing '@' (64) must not prepend ESC
         assert_eq!(normalize_win_conpty_input(b"\x1b[81;16;64;1;9;1_"), b"@");
+    }
+
+    #[test]
+    fn input_normalizer_translates_empty_bracketed_paste_to_alt_v_for_image_paste() {
+        // Contiguous empty bracketed paste (Windows Terminal Ctrl+V with image clipboard)
+        assert_eq!(
+            normalize_win_conpty_input(b"\x1b[200~\x1b[201~"),
+            b"\x1bv"
+        );
+        // Non-empty text paste must pass through unchanged
+        assert_eq!(
+            normalize_win_conpty_input(b"\x1b[200~hello world\x1b[201~"),
+            b"\x1b[200~hello world\x1b[201~"
+        );
+        // Split across two reads: empty paste
+        let mut norm = WinConptyInputNormalizer::new();
+        assert_eq!(norm.process(b"\x1b[200~"), b"");
+        assert_eq!(norm.process(b"\x1b[201~"), b"\x1bv");
+        // Split across two reads: non-empty paste
+        assert_eq!(norm.process(b"\x1b[200~"), b"");
+        assert_eq!(norm.process(b"hello\x1b[201~"), b"\x1b[200~hello\x1b[201~");
     }
 }

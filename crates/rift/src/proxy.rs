@@ -1,7 +1,7 @@
 use crate::config::{default_shell, normalize_ws_url, platform_tag, RiftConfig};
 use crate::console::RawConsoleGuard;
 #[cfg(windows)]
-use crate::console::{normalize_win_conpty_input, WinOutputKeyboardFilter};
+use crate::console::{normalize_win_conpty_input, WinConptyInputNormalizer, WinOutputKeyboardFilter};
 use crate::daemon::spawn_detached_session;
 use crate::protocol::{
     decode_binary_frame, encode_binary_frame, ByteRingBuffer, ControlMessage, FRAME_PTY_INPUT,
@@ -348,12 +348,14 @@ pub async fn run_proxy(opts: ProxyRunOptions) -> Result<i32> {
             std::thread::spawn(move || {
                 let mut stdin = std::io::stdin();
                 let mut buf = [0u8; 1024];
+                #[cfg(windows)]
+                let mut win_in_norm = WinConptyInputNormalizer::new();
                 while !shutting_down.load(Ordering::Relaxed) {
                     match stdin.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             #[cfg(windows)]
-                            let normalized = normalize_win_conpty_input(&buf[..n]);
+                            let normalized = win_in_norm.process(&buf[..n]);
                             #[cfg(windows)]
                             let to_write = normalized.as_slice();
                             #[cfg(not(windows))]
