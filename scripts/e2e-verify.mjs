@@ -263,23 +263,139 @@ async function main() {
   }
   console.log("   OK: active AI agent state reporting (running -> tool -> idle) verified.");
 
-  console.log("7. Testing Rust auto-reconnect & Ring Buffer restore after Relay restart...");
+  console.log("6.5. Testing custom rename persistence across Relay restart...");
+  viewer1.ws.send(JSON.stringify({ type: "term.rename", sessionId: sid1, title: "我的核心窗口" }));
+  await waitUntil(
+    viewer1,
+    () => {
+      const h = viewer1.hosts.find((x) => x.hostName === "Win-A1");
+      return h && h.sessions[0]?.title === "我的核心窗口" && h.sessions[0]?.customTitle === true;
+    },
+    "session renamed to 我的核心窗口"
+  );
+  // Allow agent a moment to receive and store term.rename before relay restart
+  await new Promise((r) => setTimeout(r, 150));
+  console.log("   OK: custom rename synced to relay & agent.");
+
+  console.log("7. Testing Rust auto-reconnect, Ring Buffer & custom title restore after Relay restart...");
   viewer1.ws.close();
   viewer2.ws.close();
   killChild(relay);
   await new Promise((r) => setTimeout(r, 500));
-  relay = spawnProc(process.execPath, [relayEntry], { PORT: String(PORT), HOST: "127.0.0.1" });
+  relay = spawnProc(process.execPath, [relayEntry], {
+    PORT: String(PORT),
+    HOST: "127.0.0.1",
+    SESSION_GRACE_MS: "1200",
+  });
   await waitForHealth();
   const viewer3 = await createWebViewer();
   await waitUntil(viewer3, () => viewer3.hosts.length === 2, "both Rust clients auto-reconnected");
+  const reconnectedA1 = viewer3.hosts.find((h) => h.hostName === "Win-A1");
+  assert.equal(
+    reconnectedA1.sessions[0].title,
+    "我的核心窗口",
+    "custom title must survive relay restart"
+  );
+  assert.equal(reconnectedA1.sessions[0].customTitle, true);
   viewer3.ws.send(JSON.stringify({ type: "web.attach", sessionId: sid1 }));
   await waitUntil(
     viewer3,
     () => (viewer3.replayBySession.get(sid1) ?? "").includes("RIFT_RUST_OK_777"),
     "Rust client restored Ring Buffer after relay restart"
   );
+  console.log("   OK: Rust auto-reconnect, Ring Buffer & custom title restore verified.");
+
+  console.log("8. Testing abnormal disconnect grace period & legacy-agent remembered title...");
+  const mockSid = "deadbeef1234";
+  const connectMockAgent = () =>
+    new Promise((resolve, reject) => {
+      const sock = new WebSocket(`${BASE_WS}/ws/agent`);
+      sock.on("open", () => {
+        sock.send(
+          JSON.stringify({
+            type: "agent.register",
+            hostId: "Mock-Host",
+            hostName: "Mock-Host",
+            platform: "win32",
+            sessionId: mockSid,
+            title: "system32",
+            shell: "pwsh.exe",
+            cwd: "C:\\Windows\\system32",
+            cols: 120,
+            rows: 32,
+          })
+        );
+        resolve(sock);
+      });
+      sock.on("error", reject);
+    });
+
+  let mockWs = await connectMockAgent();
+  await waitUntil(
+    viewer3,
+    () => viewer3.hosts.some((h) => h.sessions.some((s) => s.sessionId === mockSid)),
+    "mock agent registered"
+  );
+  viewer3.ws.send(JSON.stringify({ type: "term.rename", sessionId: mockSid, title: "保留标题" }));
+  await waitUntil(
+    viewer3,
+    () => {
+      const s = viewer3.hosts.flatMap((h) => h.sessions).find((x) => x.sessionId === mockSid);
+      return s && s.title === "保留标题" && s.customTitle === true;
+    },
+    "mock agent renamed"
+  );
+
+  // Simulate abrupt TCP drop (no close code 1000) -> session stays in list during grace period
+  mockWs.terminate();
+  await waitUntil(
+    viewer3,
+    () => {
+      const s = viewer3.hosts.flatMap((h) => h.sessions).find((x) => x.sessionId === mockSid);
+      return Boolean(s && s.reconnecting === true && s.title === "保留标题");
+    },
+    "session stays visible as reconnecting during grace period"
+  );
+
+  // Reconnect within grace period (simulating legacy agent sending default "system32")
+  mockWs = await connectMockAgent();
+  await waitUntil(
+    viewer3,
+    () => {
+      const s = viewer3.hosts.flatMap((h) => h.sessions).find((x) => x.sessionId === mockSid);
+      return Boolean(s && !s.reconnecting && s.title === "保留标题" && s.customTitle === true);
+    },
+    "session resumed seamlessly within grace period with custom title intact"
+  );
+
+  // Drop again and let grace period expire -> session goes offline, then reconnects and STILL keeps custom title
+  mockWs.terminate();
+  await waitUntil(
+    viewer3,
+    () => !viewer3.hosts.flatMap((h) => h.sessions).some((x) => x.sessionId === mockSid),
+    "session removed after grace period expires"
+  );
+  mockWs = await connectMockAgent();
+  await waitUntil(
+    viewer3,
+    () => {
+      const s = viewer3.hosts.flatMap((h) => h.sessions).find((x) => x.sessionId === mockSid);
+      return Boolean(s && s.title === "保留标题" && s.customTitle === true);
+    },
+    "legacy agent restored custom title from relay rememberedTitles after long sleep"
+  );
+
+  // Clean close (code 1000) removes immediately without waiting for grace period
+  const t0 = Date.now();
+  mockWs.close(1000, "shell_exit");
+  await waitUntil(
+    viewer3,
+    () => !viewer3.hosts.flatMap((h) => h.sessions).some((x) => x.sessionId === mockSid),
+    "clean close removes session immediately"
+  );
+  assert.ok(Date.now() - t0 < 900, "clean close should not wait for grace period");
   viewer3.ws.close();
-  console.log("   OK: Rust auto-reconnect & Ring Buffer restore verified.");
+  console.log("   OK: grace period, remembered title & instant clean close verified.");
 
   console.log("\nALL RUST RIFT E2E CHECKS PASSED!");
 }

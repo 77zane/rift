@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  verify-linux:
+    name: Verify (Linux — TS + Rust + Browser Smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Typecheck & build all TS workspaces
+        run: npm run typecheck && npm run build
+
+      - name: Verify TS <-> Rust protocol sync
+        run: npm run check:protocol
+
+      - name: Check Rust compilation without warnings (non-test build)
+        run: cargo check --manifest-path crates/rift/Cargo.toml
+
+      - name: Run TS & Rust unit tests
+        run: npm test
+
+      - name: Run headless browser smoke test
+        run: node scripts/browser-smoke.mjs --require-browser
+
+      - name: Living spec touch check (non-blocking)
+        run: npm run check:spec
+
+  verify-windows-rust:
+    name: Verify Rust (Windows — ConPTY & Win32 FFI)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Check & test Rust crate on Windows
+        run: |
+          cargo check --manifest-path crates/rift/Cargo.toml
+          cargo test --manifest-path crates/rift/Cargo.toml

@@ -12,6 +12,14 @@
     "relay": "node packages/relay/dist/index.js",
     "agent": "node packages/agent/dist/index.js",
     "attach": "node packages/agent/dist/index.js attach",
-    "test:e2e": "node scripts/e2e-verify.mjs"
+    "check:protocol": "node scripts/check-protocol-sync.mjs",
+    "check:spec": "node scripts/check-spec-touch.mjs",
+    "test:unit": "node --test packages/shared/test/*.test.mjs packages/web/test/*.test.mjs",
+    "test:rust": "cargo test --manifest-path crates/rift/Cargo.toml",
+    "test": "npm run test:unit && npm run test:rust",
+    "test:win-keys": "node scripts/win-conpty-keys.mjs",
+    "test:browser": "node scripts/browser-smoke.mjs",
+    "test:e2e": "node scripts/e2e-verify.mjs",
+    "check": "npm run typecheck && npm run build && npm run check:protocol && npm test && npm run test:browser && npm run check:spec"
   }
 }
