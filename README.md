@@ -113,7 +113,7 @@ rift                 # 手动以透明代理启动默认 Shell（setup 绑定后
 rift -- cmd.exe      # 指定启动任意 Shell 或 CLI
 rift daemon          # 常驻保活主机在线（0 会话时手机也可随时点 + 远程新建）
 rift attach          # 本地终端接管远程点 + 出来的后台会话（按 Ctrl+] 脱离不杀进程）
-rift uninstall       # 一键停止守护、移除开机自启与所有 Shell / AI 钩子（加 --purge 同时清配置）
+rift uninstall       # 一键停止守护、移除开机自启与所有 Shell / AI 钩子（加 --purge 彻底清除程序、配置与 PATH）
 ```
 
 > 临时想开一个不上云的纯本地窗口：设置环境变量 `RIFT_DISABLE=1` 即可跳过自动接入。
@@ -126,7 +126,10 @@ rift uninstall       # 一键停止守护、移除开机自启与所有 Shell / 
 npm run build
 cargo build --release --manifest-path crates/rift/Cargo.toml
 npm run test:e2e
+npm run test:win-keys   # Windows：嵌套 ConPTY 键位契约
 ```
+
+> 完整本地门禁（与 CI 同一命令）：`npm run check`；无 cargo 快速档：`npm run check:quick`。
 
 ---
 

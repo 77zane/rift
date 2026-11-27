@@ -83,7 +83,7 @@ enum Commands {
     },
     /// Cleanly remove autostart daemon, shell hooks, and AI agent hooks
     Uninstall {
-        /// Also remove ~/.rift directory and config
+        /// Also remove ~/.rift, installed binary, and user PATH entry
         #[arg(long)]
         purge: bool,
     },

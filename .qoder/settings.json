@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${QODER_PROJECT_DIR}/scripts/hooks/guard-tool.mjs\"",
+            "name": "rift-safety-guard",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

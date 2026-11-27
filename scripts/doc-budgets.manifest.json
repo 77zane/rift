@@ -1,0 +1,4 @@
+{
+  "AGENTS.md": { "maxUnits": 1400, "maxBytes": 5500 },
+  "docs/SPEC.md": { "maxUnits": 1600, "maxBytes": 8000 }
+}

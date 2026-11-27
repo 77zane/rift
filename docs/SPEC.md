@@ -52,11 +52,13 @@
 ## 4. 已验证边界（Automated vs Manual）
 
 ### 自动化门禁覆盖
-- **静态检查**：`npm run typecheck`、`npm run build`、`npm run check:protocol`（TS ↔ Rust 协议对齐）、`npm run check:spec`（活 Spec 非阻塞提醒）。
-- **单测（`npm test`）**：
-  - `@rift/shared`：二进制帧编解码、`ByteRingBuffer` >512KB 无损回放、`replace()` 偏移推进。
-  - `@rift/web`：语音/多行粘贴防误提交、`bootId` 变更清游标、`headless` 尺寸模式策略。
-  - `crates/rift`：Windows ConsoleMode 标志位、Kitty/MOK/win32-input-mode 输出过滤与输入翻译、`protocol` 编解码与 serde、`agent_hook` 状态修正、`setup` Claude 钩子 matcher、`config` WS URL 规范化、`proxy` base64 与 OSC 标题过滤。
+- **统一门禁**：`npm run check`（本地与 CI 同一命令，调度器 `scripts/run-gates.mjs`）串联静态门禁→typecheck/build→cargo check→三层测试→cargo test→浏览器冒烟→spec 提醒；快速档 `check:quick`（无 cargo）。
+- **架构边界门禁**（`scripts/check-boundaries.mjs`，TS AST）：包分层（跨包仅许 `@rift/shared`）、shared/web 禁 Node 内建、禁真空 catch（仅含注释者合法）；`scripts/`、`tests/` 不扫描。
+- **三层测试**（`npm test` = unit+boundary+architecture，另 `test:rust`）：
+  - **unit**（`packages/*/test`）：`@rift/shared` 二进制帧编解码、`ByteRingBuffer` >512KB 无损回放、`replace()` 偏移推进；`@rift/web` 语音/多行粘贴防误提交、`bootId` 变更清游标、`headless` 尺寸策略。
+  - **boundary**（`tests/boundary`，真实 spawn relay dist + WS）：4MiB 无损冷回放、`sinceSeq` 增量、重启复位、断线宽限、`customTitle` 保留、输入往返。
+  - **architecture**（`tests/architecture`）：各门禁可证伪反例自测、钩子 fail-closed 契约、SPEC 源码锚点存在性。
+  - `crates/rift`：Windows ConsoleMode 标志位、Kitty/MOK/win32-input-mode 输出过滤与输入翻译、`protocol` 编解码与 serde、`agent_hook` 状态修正、`setup`（Claude 钩子 matcher、卸载时剪除空 `hooks`、移除用户 `PATH`、清空空 Profile 文件及彻底 purge 二进制与 `~/.rift`）、`config` WS URL 规范化、`proxy` base64 与 OSC 标题过滤。
 - **真实集成回归**：
   - `npm run test:browser`：真实无头 Chrome/Edge 加载 Vite 生产包 `packages/web/dist/`，灌入 `DECRQM`（`\x1b[?2026$p`）+ DEC 2026 + Unicode `○`/中文，验证 0 JS 异常、输入往返、Relay 重启后 `bootId` 自动恢复。
   - `npm run test:win-keys`（Windows）：嵌套真实 `rift.exe` 于 ConPTY，验证 `Esc`/`Ctrl+C`/方向键/`Home`/`End`/`Shift+Tab`/中文全通且不泄漏 Kitty/MOK/win32-input-mode。
@@ -66,3 +68,4 @@
 - 真实 Windows Terminal 实体窗口中直接运行 `agy` / `claude` 的键盘交互、剪贴板粘贴图片与窗口缩放手感。
 - 手机 4G/5G 弱网切换及移动端虚拟键盘 / 语音输入法联调。
 - macOS / Linux 实体终端（Ghostty / Alacritty / SSH）实机验证。
+- Qoder 钩子（`.qoder/settings.json`）真机发现与实时拦截：自动化仅验子进程 stdin/stdout/exit 契约，须重启后人工冒烟。

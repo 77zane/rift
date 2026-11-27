@@ -136,15 +136,85 @@ fn ensure_windows_user_path(bin_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
+fn remove_path_entry(path_env: &str, target_dir: &str) -> Option<String> {
+    let normalize = |s: &str| {
+        s.trim()
+            .trim_matches('"')
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    };
+    let needle = normalize(target_dir);
+    if needle.is_empty() {
+        return None;
+    }
+    let mut removed = false;
+    let kept: Vec<&str> = path_env
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| {
+            if normalize(part) == needle {
+                removed = true;
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+    if removed {
+        Some(kept.join(";"))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+fn remove_windows_user_path(bin_dir: &Path) -> Result<bool> {
+    let out = Command::new("powershell.exe")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); \
+             $p = [Environment]::GetEnvironmentVariable('Path', 'User'); \
+             if ($p) { [Console]::Out.Write($p) }",
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Ok(false);
+    }
+    let current_path = String::from_utf8_lossy(&out.stdout);
+    let Some(updated) = remove_path_entry(&current_path, &bin_dir.to_string_lossy()) else {
+        return Ok(false);
+    };
+    let status = Command::new("powershell.exe")
+        .env("RIFT_NEW_USER_PATH", &updated)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[Environment]::SetEnvironmentVariable('Path', $env:RIFT_NEW_USER_PATH, 'User')",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    Ok(status.success())
+}
+
 fn strip_marked_block(content: &str) -> String {
     if let (Some(start), Some(end)) = (content.find(MARKER_START), content.find(MARKER_END)) {
-        let after_end = end + MARKER_END.len();
-        let before = &content[..start];
-        let after = content[after_end..].trim_start_matches(['\r', '\n']);
-        format!("{before}{after}")
-    } else {
-        content.to_string()
+        if start <= end {
+            let after_end = end + MARKER_END.len();
+            let before = &content[..start];
+            let after = content[after_end..].trim_start_matches(['\r', '\n']);
+            return format!("{before}{after}");
+        }
     }
+    content.to_string()
 }
 
 fn write_marked_block(path: &Path, block: &str) -> Result<()> {
@@ -173,7 +243,11 @@ fn remove_marked_block(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     let cleaned = strip_marked_block(&existing);
-    fs::write(path, cleaned)?;
+    if cleaned.trim().is_empty() {
+        let _ = fs::remove_file(path);
+    } else {
+        fs::write(path, cleaned)?;
+    }
     Ok(true)
 }
 
@@ -427,6 +501,38 @@ fn install_agent_hooks(exe: &Path) -> Result<Vec<String>> {
     Ok(installed)
 }
 
+fn prune_claude_hooks(root: &mut Value) -> bool {
+    let mut changed = false;
+    let mut remove_hooks_key = false;
+    if let Some(hooks_obj) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) {
+        let mut empty_keys = Vec::new();
+        for (k, v) in hooks_obj.iter_mut() {
+            if let Some(list) = v.as_array_mut() {
+                let before = list.len();
+                list.retain(|item| !item.to_string().contains("agent-hook --agent claude"));
+                if list.len() != before {
+                    changed = true;
+                    if list.is_empty() {
+                        empty_keys.push(k.clone());
+                    }
+                }
+            }
+        }
+        for k in empty_keys {
+            hooks_obj.remove(&k);
+        }
+        if changed && hooks_obj.is_empty() {
+            remove_hooks_key = true;
+        }
+    }
+    if remove_hooks_key {
+        if let Some(obj) = root.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+    changed
+}
+
 fn uninstall_agent_hooks() -> Result<Vec<String>> {
     let home = dirs::home_dir().context("无法获取用户主目录")?;
     let mut removed = Vec::new();
@@ -446,17 +552,10 @@ fn uninstall_agent_hooks() -> Result<Vec<String>> {
         if let Ok(text) = fs::read_to_string(&claude_settings) {
             if text.contains("agent-hook --agent claude") {
                 if let Ok(mut root) = serde_json::from_str::<Value>(&text) {
-                    if let Some(hooks_obj) = root.get_mut("hooks").and_then(|v| v.as_object_mut()) {
-                        for (_k, v) in hooks_obj.iter_mut() {
-                            if let Some(list) = v.as_array_mut() {
-                                list.retain(|item| {
-                                    !item.to_string().contains("agent-hook --agent claude")
-                                });
-                            }
-                        }
+                    if prune_claude_hooks(&mut root) {
+                        let _ = fs::write(&claude_settings, serde_json::to_string_pretty(&root)?);
+                        removed.push("Claude Code".to_string());
                     }
-                    let _ = fs::write(&claude_settings, serde_json::to_string_pretty(&root)?);
-                    removed.push("Claude Code".to_string());
                 }
             }
         }
@@ -665,6 +764,146 @@ pub fn run_setup(opts: SetupOptions) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PurgeOutcome {
+    NothingToRemove,
+    Removed,
+    RemovedWithTempCleanup(PathBuf),
+    ScheduledDelayedCleanup(PathBuf),
+}
+
+fn clear_or_stage_dir(dir: &Path, staged_dir: &Path, counter: &mut usize) -> bool {
+    let mut staged_any = false;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            if fs::remove_dir_all(&path).is_err() {
+                if clear_or_stage_dir(&path, staged_dir, counter) {
+                    staged_any = true;
+                }
+                let _ = fs::remove_dir(&path);
+            }
+        } else if fs::remove_file(&path).is_err() && fs::create_dir_all(staged_dir).is_ok() {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "file".to_string());
+            let dst = staged_dir.join(format!("{}-{name}", *counter));
+            *counter += 1;
+            if fs::rename(&path, &dst).is_ok() {
+                staged_any = true;
+            }
+        }
+    }
+    staged_any
+}
+
+fn purge_install_artifacts(
+    rift_dir: &Path,
+    external_exe: Option<&Path>,
+    temp_base: &Path,
+) -> PurgeOutcome {
+    let has_dir = rift_dir.exists();
+    let ext_target = external_exe.filter(|p| !p.starts_with(rift_dir) && p.exists());
+    if !has_dir && ext_target.is_none() {
+        return PurgeOutcome::NothingToRemove;
+    }
+
+    let mut ext_locked = false;
+    if let Some(bin) = ext_target {
+        if fs::remove_file(bin).is_err() {
+            ext_locked = true;
+        }
+    }
+
+    if !has_dir {
+        return if ext_locked {
+            PurgeOutcome::ScheduledDelayedCleanup(ext_target.unwrap().to_path_buf())
+        } else {
+            PurgeOutcome::Removed
+        };
+    }
+
+    if fs::remove_dir_all(rift_dir).is_ok() && !ext_locked {
+        return PurgeOutcome::Removed;
+    }
+
+    // Windows cannot delete a running executable in place, but NTFS allows renaming it aside
+    // into %TEMP% on the same volume so ~/.rift itself disappears immediately.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let staged_dir = temp_base.join(format!("rift-uninstall-{}-{ts}", std::process::id()));
+    let mut counter = 0usize;
+    let staged_any = clear_or_stage_dir(rift_dir, &staged_dir, &mut counter);
+    let _ = fs::remove_dir_all(rift_dir);
+
+    if !rift_dir.exists() && !ext_locked {
+        if staged_any {
+            PurgeOutcome::RemovedWithTempCleanup(staged_dir)
+        } else {
+            PurgeOutcome::Removed
+        }
+    } else {
+        PurgeOutcome::ScheduledDelayedCleanup(rift_dir.to_path_buf())
+    }
+}
+
+#[cfg(windows)]
+fn schedule_windows_post_exit_cleanup(target: &Path) {
+    let mut cmd = Command::new("powershell.exe");
+    cmd.env("RIFT_SELF_PID", std::process::id().to_string())
+        .env("RIFT_PURGE_TARGET", target)
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            "Wait-Process -Id ([int]$env:RIFT_SELF_PID) -Timeout 5 -ErrorAction SilentlyContinue; \
+             for ($i = 0; $i -lt 10; $i++) { \
+               if (-not (Test-Path -LiteralPath $env:RIFT_PURGE_TARGET)) { break }; \
+               Remove-Item -LiteralPath $env:RIFT_PURGE_TARGET -Recurse -Force -ErrorAction SilentlyContinue; \
+               Start-Sleep -Milliseconds 300 \
+             }",
+        ]);
+    let _ = crate::daemon::spawn_detached_command(&mut cmd);
+}
+
+#[cfg(windows)]
+fn has_other_rift_processes() -> bool {
+    if std::env::var("RIFT_SESSION_ID")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    let self_pid = std::process::id();
+    let out = Command::new("powershell.exe")
+        .env("RIFT_SELF_PID", self_pid.to_string())
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$self = [int]$env:RIFT_SELF_PID; \
+             @(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'rift.exe' -and $_.ProcessId -ne $self }).Count",
+        ])
+        .output();
+    out.ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<usize>().ok())
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
 pub fn run_uninstall(purge: bool) -> Result<()> {
     let _ = uninstall_autostart();
     let shell_removed = uninstall_shell_hooks()?;
@@ -680,9 +919,69 @@ pub fn run_uninstall(purge: bool) -> Result<()> {
     }
     if purge {
         if let Some(home) = dirs::home_dir() {
-            let _ = fs::remove_dir_all(home.join(".rift"));
-            println!("  ✓ 已清理 ~/.rift 目录");
+            let rift_dir = home.join(".rift");
+            #[cfg(windows)]
+            {
+                let bin_dir = rift_dir.join("bin");
+                if remove_windows_user_path(&bin_dir).unwrap_or(false) {
+                    println!("  ✓ 已从用户 PATH 移除 {}", bin_dir.display());
+                }
+            }
+
+            let ext_exe = permanent_exe_path().ok();
+            let outcome =
+                purge_install_artifacts(&rift_dir, ext_exe.as_deref(), &std::env::temp_dir());
+            match outcome {
+                PurgeOutcome::NothingToRemove => {
+                    println!("  ✓ 未发现残留的 ~/.rift 或已安装程序");
+                }
+                PurgeOutcome::Removed => {
+                    println!("  ✓ 已彻底清理 ~/.rift 目录与已安装可执行文件");
+                }
+                PurgeOutcome::RemovedWithTempCleanup(staged_dir) => {
+                    #[cfg(windows)]
+                    schedule_windows_post_exit_cleanup(&staged_dir);
+                    #[cfg(not(windows))]
+                    let _ = fs::remove_dir_all(&staged_dir);
+                    println!("  ✓ 已彻底清理 ~/.rift 目录（退出后自动清理临时副本）");
+                }
+                PurgeOutcome::ScheduledDelayedCleanup(remaining) => {
+                    #[cfg(windows)]
+                    {
+                        schedule_windows_post_exit_cleanup(&remaining);
+                        if has_other_rift_processes() {
+                            println!(
+                                "  ⚠ 部分文件仍被运行中的旧终端占用：{}",
+                                remaining.display()
+                            );
+                            println!(
+                                "    关闭所有旧终端后如仍有残留，请运行: Remove-Item -Recurse -Force \"{}\"",
+                                remaining.display()
+                            );
+                        } else {
+                            println!(
+                                "  ✓ 已安排退出后自动清理残留目录: {}",
+                                remaining.display()
+                            );
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        println!(
+                            "  ⚠ 未能完全删除（请检查权限）: {}",
+                            remaining.display()
+                        );
+                    }
+                }
+            }
         }
+    } else {
+        println!("  提示：如需连同程序、~/.rift 配置目录与 PATH 一并彻底删除，请运行 `rift uninstall --purge`。");
+    }
+
+    #[cfg(windows)]
+    if has_other_rift_processes() {
+        println!("  ℹ 当前或其它已打开的旧终端仍由旧 rift 进程托管；关闭后新开终端即完全脱离 Rift。");
     }
     Ok(())
 }
@@ -719,5 +1018,121 @@ mod tests {
         // Idempotent when invoked a second time
         merge_claude_hooks(&mut settings, "/usr/local/bin/rift");
         assert_eq!(settings["hooks"]["Notification"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn uninstall_prune_claude_hooks_removes_empty_hooks_object() {
+        let mut settings = json!({
+            "model": "opus",
+            "theme": "dark"
+        });
+        merge_claude_hooks(&mut settings, r"C:\Users\7\.rift\bin\rift.exe");
+        assert!(settings.get("hooks").is_some());
+
+        assert!(prune_claude_hooks(&mut settings));
+        assert!(
+            settings.get("hooks").is_none(),
+            "empty hooks object should be removed completely"
+        );
+        assert_eq!(settings["model"], "opus");
+        assert_eq!(settings["theme"], "dark");
+    }
+
+    #[test]
+    fn uninstall_prune_claude_hooks_preserves_user_hooks_and_unrelated_files() {
+        let mut settings = json!({
+            "hooks": {
+                "Notification": [
+                    { "matcher": "*", "hooks": [{ "type": "command", "command": "echo keep-me" }] }
+                ],
+                "CustomEvent": []
+            }
+        });
+
+        // No rift hooks yet -> untouched
+        assert!(!prune_claude_hooks(&mut settings));
+        assert!(settings["hooks"].get("CustomEvent").is_some());
+
+        // Install rift hooks then prune -> user hook & CustomEvent survive, rift-only events removed
+        merge_claude_hooks(&mut settings, "/usr/local/bin/rift");
+        assert!(prune_claude_hooks(&mut settings));
+        let hooks = settings["hooks"].as_object().expect("hooks object retained");
+        assert_eq!(hooks["Notification"].as_array().unwrap().len(), 1);
+        assert!(hooks.contains_key("CustomEvent"));
+        assert!(!hooks.contains_key("Stop"));
+        assert!(!hooks.contains_key("PreToolUse"));
+        assert!(!hooks.contains_key("UserPromptSubmit"));
+    }
+
+    #[test]
+    fn uninstall_remove_path_entry_handles_case_quotes_and_trailing_slashes() {
+        let path_val = r#"C:\Windows\System32;"C:\USERS\7\.rift\bin\";C:\Users\7\.cargo\bin;C:/Users/7/.rift/bin"#;
+        let updated = remove_path_entry(path_val, r"C:\Users\7\.rift\bin")
+            .expect("should remove matching entries");
+        assert_eq!(updated, r"C:\Windows\System32;C:\Users\7\.cargo\bin");
+
+        // Idempotent when target no longer exists
+        assert_eq!(remove_path_entry(&updated, r"C:\Users\7\.rift\bin"), None);
+    }
+
+    #[test]
+    fn uninstall_remove_marked_block_deletes_file_if_empty_and_preserves_user_content() {
+        let base = std::env::temp_dir().join(format!(
+            "rift-setup-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+
+        let only_rift = base.join("only_rift.ps1");
+        let block = format!("{MARKER_START}\necho rift\n{MARKER_END}\n");
+        write_marked_block(&only_rift, &block).unwrap();
+        assert!(remove_marked_block(&only_rift).unwrap());
+        assert!(
+            !only_rift.exists(),
+            "profile created solely for rift hook should be deleted once empty"
+        );
+
+        let with_user = base.join("with_user.ps1");
+        fs::write(&with_user, "function myfn { echo hi }\n").unwrap();
+        write_marked_block(&with_user, &block).unwrap();
+        assert!(remove_marked_block(&with_user).unwrap());
+        assert_eq!(
+            fs::read_to_string(&with_user).unwrap(),
+            "function myfn { echo hi }\n"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn uninstall_purge_removes_rift_dir_and_external_binary() {
+        let base = std::env::temp_dir().join(format!(
+            "rift-purge-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let rift_dir = base.join(".rift");
+        let ext_bin = base.join(".local").join("bin").join("rift");
+        fs::create_dir_all(rift_dir.join("uploads")).unwrap();
+        fs::create_dir_all(ext_bin.parent().unwrap()).unwrap();
+        fs::write(rift_dir.join("config.json"), "{}").unwrap();
+        fs::write(rift_dir.join("uploads").join("a.png"), b"png").unwrap();
+        fs::write(&ext_bin, b"bin").unwrap();
+
+        let outcome = purge_install_artifacts(&rift_dir, Some(&ext_bin), &base.join("tmp"));
+        assert_eq!(outcome, PurgeOutcome::Removed);
+        assert!(!rift_dir.exists());
+        assert!(!ext_bin.exists());
+
+        // Idempotent second run
+        let outcome2 = purge_install_artifacts(&rift_dir, Some(&ext_bin), &base.join("tmp"));
+        assert_eq!(outcome2, PurgeOutcome::NothingToRemove);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

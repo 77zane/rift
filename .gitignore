@@ -10,3 +10,11 @@ zellij.exe
 zellij-terminal.exe
 .DS_Store
 Thumbs.db
+
+# Harness private / local overrides (never committed; .qoder/settings.json & skills ARE shared)
+AGENTS.override.md
+*.local.md
+*.local.json
+HANDOFF.md
+.scratch/
+.qoder/settings.local.json

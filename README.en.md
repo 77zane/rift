@@ -113,7 +113,7 @@ rift                 # Manually wrap default shell (automatic once hooked via se
 rift -- cmd.exe      # Wrap any specific shell or CLI
 rift daemon          # Keep host online with 0 open sessions so remote `+` always works
 rift attach          # Attach local terminal to a remote-spawned session (Ctrl+] to detach)
-rift uninstall       # Cleanly stop daemon, remove autostart & strip all shell/AI hooks (--purge removes ~/.rift)
+rift uninstall       # Cleanly stop daemon, remove autostart & strip all shell/AI hooks (--purge removes binary, ~/.rift & PATH)
 ```
 
 > Set `RIFT_DISABLE=1` to temporarily bypass auto-mirroring in any shell.
@@ -126,7 +126,10 @@ rift uninstall       # Cleanly stop daemon, remove autostart & strip all shell/A
 npm run build
 cargo build --release --manifest-path crates/rift/Cargo.toml
 npm run test:e2e
+npm run test:win-keys   # Windows: nested ConPTY key contract
 ```
+
+> Full local gate (identical to CI): `npm run check`; quick tier without cargo: `npm run check:quick`.
 
 ---
 

@@ -12,14 +12,24 @@
     "relay": "node packages/relay/dist/index.js",
     "agent": "node packages/agent/dist/index.js",
     "attach": "node packages/agent/dist/index.js attach",
+    "check": "node scripts/run-gates.mjs --mode check",
+    "check:quick": "node scripts/run-gates.mjs --mode quick",
+    "check:docs": "node scripts/run-gates.mjs --mode doc-sync",
+    "check:budgets": "node scripts/verify-doc-budgets.mjs",
+    "check:links": "node scripts/verify-md-links.mjs",
+    "check:boundaries": "node scripts/check-boundaries.mjs",
+    "check:tests": "node scripts/check-test-patterns.mjs",
+    "check:hygiene": "node scripts/check-file-hygiene.mjs --check",
+    "fix:hygiene": "node scripts/check-file-hygiene.mjs --fix",
     "check:protocol": "node scripts/check-protocol-sync.mjs",
     "check:spec": "node scripts/check-spec-touch.mjs",
-    "test:unit": "node --test packages/shared/test/*.test.mjs packages/web/test/*.test.mjs",
+    "test:unit": "npm run build -w @rift/shared && node scripts/run-gates.mjs --test unit",
+    "test:boundary": "npm run build -w @rift/shared && npm run build -w @rift/relay && node scripts/run-gates.mjs --test boundary",
+    "test:arch": "node scripts/run-gates.mjs --test architecture",
     "test:rust": "cargo test --manifest-path crates/rift/Cargo.toml",
-    "test": "npm run test:unit && npm run test:rust",
+    "test": "npm run build && node scripts/run-gates.mjs --test unit,boundary,architecture && npm run test:rust",
     "test:win-keys": "node scripts/win-conpty-keys.mjs",
     "test:browser": "node scripts/browser-smoke.mjs",
-    "test:e2e": "node scripts/e2e-verify.mjs",
-    "check": "npm run typecheck && npm run build && npm run check:protocol && npm test && npm run test:browser && npm run check:spec"
+    "test:e2e": "node scripts/e2e-verify.mjs"
   }
 }

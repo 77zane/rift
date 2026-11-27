@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   verify-linux:
     name: Verify (Linux — TS + Rust + Browser Smoke)
@@ -27,23 +30,12 @@ jobs:
       - name: Install Node dependencies
         run: npm ci
 
-      - name: Typecheck & build all TS workspaces
-        run: npm run typecheck && npm run build
-
-      - name: Verify TS <-> Rust protocol sync
-        run: npm run check:protocol
-
-      - name: Check Rust compilation without warnings (non-test build)
-        run: cargo check --manifest-path crates/rift/Cargo.toml
-
-      - name: Run TS & Rust unit tests
-        run: npm test
-
-      - name: Run headless browser smoke test
-        run: node scripts/browser-smoke.mjs --require-browser
-
-      - name: Living spec touch check (non-blocking)
-        run: npm run check:spec
+      - name: Run unified check gate (local == CI)
+        run: npm run check
+        env:
+          RIFT_REQUIRE_BROWSER: "1"
+          SPEC_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || 'origin/main' }}
+          SPEC_BEFORE_SHA: ${{ github.event.before }}
 
   verify-windows-rust:
     name: Verify Rust (Windows — ConPTY & Win32 FFI)
@@ -57,3 +49,31 @@ jobs:
         run: |
           cargo check --manifest-path crates/rift/Cargo.toml
           cargo test --manifest-path crates/rift/Cargo.toml
+
+  verify-windows-real:
+    name: Verify Real Binary (Windows — ConPTY keys + full E2E)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Build all TS workspaces
+        run: npm run build
+
+      - name: Build release rift binary
+        run: cargo build --release --manifest-path crates/rift/Cargo.toml
+
+      - name: Nested ConPTY key contract (real rift.exe)
+        run: npm run test:win-keys
+
+      - name: Full relay + Rust binary E2E
+        run: npm run test:e2e
